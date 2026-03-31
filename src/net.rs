@@ -371,7 +371,7 @@ pub async fn link_index(_handle: &Handle, name: &str) -> Result<Option<u32>> {
 /// Convert an interface index to its name via `if_indextoname(3)`.
 #[cfg(target_os = "macos")]
 fn index_to_name(index: u32) -> Result<String> {
-    let mut buf = [0u8; libc::IFNAMSIZ as usize];
+    let mut buf = [0u8; libc::IFNAMSIZ];
     let ptr =
         unsafe { libc::if_indextoname(index, buf.as_mut_ptr().cast()) };
     anyhow::ensure!(!ptr.is_null(), "if_indextoname({index}) failed");
@@ -419,9 +419,9 @@ mod macos_ioctl {
     }
 
     /// Copy an interface name into a fixed-size `[c_char; IFNAMSIZ]` buffer.
-    fn copy_ifname(dst: &mut [libc::c_char; libc::IFNAMSIZ as usize], name: &str) {
+    fn copy_ifname(dst: &mut [libc::c_char; libc::IFNAMSIZ], name: &str) {
         let bytes = name.as_bytes();
-        let len = bytes.len().min(libc::IFNAMSIZ as usize - 1);
+        let len = bytes.len().min(libc::IFNAMSIZ - 1);
         for (i, &b) in bytes[..len].iter().enumerate() {
             dst[i] = b as libc::c_char;
         }
@@ -468,7 +468,7 @@ mod macos_ioctl {
         /// Mirrors `struct ifaliasreq` from `<net/if.h>`.
         #[repr(C)]
         struct IfAliasReq {
-            ifra_name:      [libc::c_char; libc::IFNAMSIZ as usize],
+            ifra_name:      [libc::c_char; libc::IFNAMSIZ],
             ifra_addr:      libc::sockaddr_in,
             ifra_broadaddr: libc::sockaddr_in,
             ifra_mask:      libc::sockaddr_in,
@@ -533,7 +533,7 @@ mod macos_ioctl {
         /// Mirrors `struct in6_aliasreq` from `<netinet6/in6_var.h>`.
         #[repr(C)]
         struct In6AliasReq {
-            ifra_name:       [libc::c_char; libc::IFNAMSIZ as usize],
+            ifra_name:       [libc::c_char; libc::IFNAMSIZ],
             ifra_addr:       libc::sockaddr_in6,
             ifra_dstaddr:    libc::sockaddr_in6,
             ifra_prefixmask: libc::sockaddr_in6,
@@ -553,13 +553,13 @@ mod macos_ioctl {
             req.ifra_prefixmask.sin6_family = libc::AF_INET6 as libc::sa_family_t;
             req.ifra_prefixmask.sin6_len    = std::mem::size_of::<libc::sockaddr_in6>() as u8;
             let mut mask = [0u8; 16];
-            for i in 0..16usize {
+            for (i, byte) in mask.iter_mut().enumerate() {
                 let start = i * 8;
                 if start >= prefix as usize {
                     break;
                 }
                 let bits = (prefix as usize - start).min(8);
-                mask[i] = 0xFFu8 << (8 - bits);
+                *byte = 0xFFu8 << (8 - bits);
             }
             req.ifra_prefixmask.sin6_addr = libc::in6_addr { s6_addr: mask };
 
@@ -584,10 +584,10 @@ mod macos_ioctl {
         /// Mirrors the `in6_ifreq` layout for `SIOCDIFADDR_IN6`.
         #[repr(C)]
         struct In6IfreqDel {
-            ifr_name: [libc::c_char; libc::IFNAMSIZ as usize],
+            ifr_name: [libc::c_char; libc::IFNAMSIZ],
             ifr_addr: libc::sockaddr_in6,
             // union padding to match sizeof(in6_ifreq) = 80 bytes
-            _pad: [u8; 80 - libc::IFNAMSIZ as usize - std::mem::size_of::<libc::sockaddr_in6>()],
+            _pad: [u8; 80 - libc::IFNAMSIZ - std::mem::size_of::<libc::sockaddr_in6>()],
         }
 
         unsafe {
