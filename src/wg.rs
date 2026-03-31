@@ -294,10 +294,10 @@ pub fn peer_handshakes(iface_name: &str) -> Result<HashMap<String, i64>> {
     for line in response.lines() {
         if let Some(hex) = line.strip_prefix("public_key=") {
             // Flush the previous peer's handshake if we had one.
-            if let Some(key) = current_key.take() {
-                if last_hs != 0 {
-                    map.insert(key, last_hs);
-                }
+            if let Some(key) = current_key.take()
+                && last_hs != 0
+            {
+                map.insert(key, last_hs);
             }
             current_key = Some(hex_to_b64(hex)?);
             last_hs = 0;
@@ -306,10 +306,10 @@ pub fn peer_handshakes(iface_name: &str) -> Result<HashMap<String, i64>> {
         }
     }
     // Flush last peer.
-    if let Some(key) = current_key {
-        if last_hs != 0 {
-            map.insert(key, last_hs);
-        }
+    if let Some(key) = current_key
+        && last_hs != 0
+    {
+        map.insert(key, last_hs);
     }
     Ok(map)
 }
@@ -463,12 +463,14 @@ fn hex_to_b64(h: &str) -> Result<String> {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Parse an IPv4 CIDR string into `(Ipv4Addr, prefix_len)`.
+#[cfg(unix)]
 fn parse_cidr_v4(cidr: &str) -> Result<(std::net::Ipv4Addr, u8)> {
     let (ip, prefix) = cidr.split_once('/').context("invalid IPv4 CIDR")?;
     Ok((ip.parse()?, prefix.parse()?))
 }
 
 /// Parse an IPv6 CIDR string into `(Ipv6Addr, prefix_len)`.
+#[cfg(unix)]
 fn parse_cidr_v6(cidr: &str) -> Result<(std::net::Ipv6Addr, u8)> {
     let (ip, prefix) = cidr.split_once('/').context("invalid IPv6 CIDR")?;
     Ok((ip.parse()?, prefix.parse()?))

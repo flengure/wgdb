@@ -405,14 +405,15 @@ mod macos_ioctl {
     /// Open a temporary `AF_INET/SOCK_DGRAM` socket for ioctl calls.
     /// The returned fd must be closed by the caller.
     unsafe fn open_sock4() -> Result<libc::c_int> {
-        let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
+        // Rust 2024: unsafe fn no longer provides an implicit unsafe context.
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
         ensure!(fd >= 0, "socket(AF_INET): {}", std::io::Error::last_os_error());
         Ok(fd)
     }
 
     /// Open a temporary `AF_INET6/SOCK_DGRAM` socket for IPv6 ioctl calls.
     unsafe fn open_sock6() -> Result<libc::c_int> {
-        let fd = libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, 0);
+        let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, 0) };
         ensure!(fd >= 0, "socket(AF_INET6): {}", std::io::Error::last_os_error());
         Ok(fd)
     }
@@ -428,34 +429,38 @@ mod macos_ioctl {
 
     /// Read-modify-write the interface flags to OR in `flags`.
     pub(super) unsafe fn set_flags(name: &str, flags: libc::c_short) -> Result<()> {
-        let fd = open_sock4()?;
-        let mut ifr: libc::ifreq = std::mem::zeroed();
-        copy_ifname(&mut ifr.ifr_name, name);
+        unsafe {
+            let fd = open_sock4()?;
+            let mut ifr: libc::ifreq = std::mem::zeroed();
+            copy_ifname(&mut ifr.ifr_name, name);
 
-        // Read current flags first.
-        let ret = libc::ioctl(fd, SIOCGIFFLAGS, &mut ifr);
-        if ret < 0 {
+            // Read current flags first.
+            let ret = libc::ioctl(fd, SIOCGIFFLAGS, &mut ifr);
+            if ret < 0 {
+                libc::close(fd);
+                anyhow::bail!("SIOCGIFFLAGS: {}", std::io::Error::last_os_error());
+            }
+            // OR in the requested flags.
+            ifr.ifr_ifru.ifru_flags |= flags;
+            let ret = libc::ioctl(fd, SIOCSIFFLAGS, &ifr);
             libc::close(fd);
-            anyhow::bail!("SIOCGIFFLAGS: {}", std::io::Error::last_os_error());
+            ensure!(ret >= 0, "SIOCSIFFLAGS: {}", std::io::Error::last_os_error());
+            Ok(())
         }
-        // OR in the requested flags.
-        ifr.ifr_ifru.ifru_flags |= flags;
-        let ret = libc::ioctl(fd, SIOCSIFFLAGS, &ifr);
-        libc::close(fd);
-        ensure!(ret >= 0, "SIOCSIFFLAGS: {}", std::io::Error::last_os_error());
-        Ok(())
     }
 
     /// Set the interface MTU.
     pub(super) unsafe fn set_mtu(name: &str, mtu: libc::c_int) -> Result<()> {
-        let fd = open_sock4()?;
-        let mut ifr: libc::ifreq = std::mem::zeroed();
-        copy_ifname(&mut ifr.ifr_name, name);
-        ifr.ifr_ifru.ifru_mtu = mtu;
-        let ret = libc::ioctl(fd, SIOCSIFMTU, &ifr);
-        libc::close(fd);
-        ensure!(ret >= 0, "SIOCSIFMTU({mtu}): {}", std::io::Error::last_os_error());
-        Ok(())
+        unsafe {
+            let fd = open_sock4()?;
+            let mut ifr: libc::ifreq = std::mem::zeroed();
+            copy_ifname(&mut ifr.ifr_name, name);
+            ifr.ifr_ifru.ifru_mtu = mtu;
+            let ret = libc::ioctl(fd, SIOCSIFMTU, &ifr);
+            libc::close(fd);
+            ensure!(ret >= 0, "SIOCSIFMTU({mtu}): {}", std::io::Error::last_os_error());
+            Ok(())
+        }
     }
 
     /// Add an IPv4 alias address + prefix to an interface via `SIOCAIFADDR`.
@@ -469,45 +474,49 @@ mod macos_ioctl {
             ifra_mask:      libc::sockaddr_in,
         }
 
-        let mut req: IfAliasReq = std::mem::zeroed();
-        copy_ifname(&mut req.ifra_name, name);
+        unsafe {
+            let mut req: IfAliasReq = std::mem::zeroed();
+            copy_ifname(&mut req.ifra_name, name);
 
-        // Address
-        req.ifra_addr.sin_family = libc::AF_INET as libc::sa_family_t;
-        req.ifra_addr.sin_len    = std::mem::size_of::<libc::sockaddr_in>() as u8;
-        req.ifra_addr.sin_addr.s_addr = u32::from(addr).to_be();
+            // Address
+            req.ifra_addr.sin_family = libc::AF_INET as libc::sa_family_t;
+            req.ifra_addr.sin_len    = std::mem::size_of::<libc::sockaddr_in>() as u8;
+            req.ifra_addr.sin_addr.s_addr = u32::from(addr).to_be();
 
-        // Netmask derived from prefix length
-        let mask = if prefix == 0 { 0u32 } else { u32::MAX << (32 - prefix as u32) };
-        req.ifra_mask.sin_family = libc::AF_INET as libc::sa_family_t;
-        req.ifra_mask.sin_len    = std::mem::size_of::<libc::sockaddr_in>() as u8;
-        req.ifra_mask.sin_addr.s_addr = mask.to_be();
+            // Netmask derived from prefix length
+            let mask = if prefix == 0 { 0u32 } else { u32::MAX << (32 - prefix as u32) };
+            req.ifra_mask.sin_family = libc::AF_INET as libc::sa_family_t;
+            req.ifra_mask.sin_len    = std::mem::size_of::<libc::sockaddr_in>() as u8;
+            req.ifra_mask.sin_addr.s_addr = mask.to_be();
 
-        let fd = open_sock4()?;
-        let ret = libc::ioctl(fd, SIOCAIFADDR, &req);
-        libc::close(fd);
-        // EEXIST means the address is already assigned — that's fine.
-        if ret < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
-            anyhow::bail!("SIOCAIFADDR: {}", std::io::Error::last_os_error());
+            let fd = open_sock4()?;
+            let ret = libc::ioctl(fd, SIOCAIFADDR, &req);
+            libc::close(fd);
+            // EEXIST means the address is already assigned — that's fine.
+            if ret < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
+                anyhow::bail!("SIOCAIFADDR: {}", std::io::Error::last_os_error());
+            }
+            Ok(())
         }
-        Ok(())
     }
 
     /// Remove an IPv4 address from an interface via `SIOCDIFADDR`.
     pub(super) unsafe fn del_addr_v4(name: &str, addr: Ipv4Addr) -> Result<()> {
-        let mut ifr: libc::ifreq = std::mem::zeroed();
-        copy_ifname(&mut ifr.ifr_name, name);
-        let sin: &mut libc::sockaddr_in =
-            &mut *(&mut ifr.ifr_ifru.ifru_addr as *mut libc::sockaddr as *mut libc::sockaddr_in);
-        sin.sin_family = libc::AF_INET as libc::sa_family_t;
-        sin.sin_len    = std::mem::size_of::<libc::sockaddr_in>() as u8;
-        sin.sin_addr.s_addr = u32::from(addr).to_be();
+        unsafe {
+            let mut ifr: libc::ifreq = std::mem::zeroed();
+            copy_ifname(&mut ifr.ifr_name, name);
+            let sin: &mut libc::sockaddr_in =
+                &mut *(&mut ifr.ifr_ifru.ifru_addr as *mut libc::sockaddr as *mut libc::sockaddr_in);
+            sin.sin_family = libc::AF_INET as libc::sa_family_t;
+            sin.sin_len    = std::mem::size_of::<libc::sockaddr_in>() as u8;
+            sin.sin_addr.s_addr = u32::from(addr).to_be();
 
-        let fd = open_sock4()?;
-        let ret = libc::ioctl(fd, SIOCDIFADDR, &ifr);
-        libc::close(fd);
-        ensure!(ret >= 0, "SIOCDIFADDR: {}", std::io::Error::last_os_error());
-        Ok(())
+            let fd = open_sock4()?;
+            let ret = libc::ioctl(fd, SIOCDIFADDR, &ifr);
+            libc::close(fd);
+            ensure!(ret >= 0, "SIOCDIFADDR: {}", std::io::Error::last_os_error());
+            Ok(())
+        }
     }
 
     /// Add an IPv6 alias address + prefix to an interface via `SIOCAIFADDR_IN6`.
@@ -532,40 +541,42 @@ mod macos_ioctl {
             ifra_lifetime:   In6AddrLifetime,
         }
 
-        let mut req: In6AliasReq = std::mem::zeroed();
-        copy_ifname(&mut req.ifra_name, name);
+        unsafe {
+            let mut req: In6AliasReq = std::mem::zeroed();
+            copy_ifname(&mut req.ifra_name, name);
 
-        req.ifra_addr.sin6_family = libc::AF_INET6 as libc::sa_family_t;
-        req.ifra_addr.sin6_len    = std::mem::size_of::<libc::sockaddr_in6>() as u8;
-        req.ifra_addr.sin6_addr   = libc::in6_addr { s6_addr: addr.octets() };
+            req.ifra_addr.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            req.ifra_addr.sin6_len    = std::mem::size_of::<libc::sockaddr_in6>() as u8;
+            req.ifra_addr.sin6_addr   = libc::in6_addr { s6_addr: addr.octets() };
 
-        // Prefix mask
-        req.ifra_prefixmask.sin6_family = libc::AF_INET6 as libc::sa_family_t;
-        req.ifra_prefixmask.sin6_len    = std::mem::size_of::<libc::sockaddr_in6>() as u8;
-        let mut mask = [0u8; 16];
-        for i in 0..16usize {
-            let start = i * 8;
-            if start >= prefix as usize {
-                break;
+            // Prefix mask
+            req.ifra_prefixmask.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            req.ifra_prefixmask.sin6_len    = std::mem::size_of::<libc::sockaddr_in6>() as u8;
+            let mut mask = [0u8; 16];
+            for i in 0..16usize {
+                let start = i * 8;
+                if start >= prefix as usize {
+                    break;
+                }
+                let bits = (prefix as usize - start).min(8);
+                mask[i] = 0xFFu8 << (8 - bits);
             }
-            let bits = (prefix as usize - start).min(8);
-            mask[i] = 0xFFu8 << (8 - bits);
-        }
-        req.ifra_prefixmask.sin6_addr = libc::in6_addr { s6_addr: mask };
+            req.ifra_prefixmask.sin6_addr = libc::in6_addr { s6_addr: mask };
 
-        // Mark address as permanent (no duplicate-address detection delay).
-        req.ifra_flags = IN6_IFF_NODAD;
-        // Infinite lifetime
-        req.ifra_lifetime.ia6t_vltime = 0xFFFF_FFFF;
-        req.ifra_lifetime.ia6t_pltime = 0xFFFF_FFFF;
+            // Mark address as permanent (no duplicate-address detection delay).
+            req.ifra_flags = IN6_IFF_NODAD;
+            // Infinite lifetime
+            req.ifra_lifetime.ia6t_vltime = 0xFFFF_FFFF;
+            req.ifra_lifetime.ia6t_pltime = 0xFFFF_FFFF;
 
-        let fd = open_sock6()?;
-        let ret = libc::ioctl(fd, SIOCAIFADDR_IN6, &req);
-        libc::close(fd);
-        if ret < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
-            anyhow::bail!("SIOCAIFADDR_IN6: {}", std::io::Error::last_os_error());
+            let fd = open_sock6()?;
+            let ret = libc::ioctl(fd, SIOCAIFADDR_IN6, &req);
+            libc::close(fd);
+            if ret < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
+                anyhow::bail!("SIOCAIFADDR_IN6: {}", std::io::Error::last_os_error());
+            }
+            Ok(())
         }
-        Ok(())
     }
 
     /// Remove an IPv6 address from an interface via `SIOCDIFADDR_IN6`.
@@ -579,17 +590,19 @@ mod macos_ioctl {
             _pad: [u8; 80 - libc::IFNAMSIZ as usize - std::mem::size_of::<libc::sockaddr_in6>()],
         }
 
-        let mut req: In6IfreqDel = std::mem::zeroed();
-        copy_ifname(&mut req.ifr_name, name);
-        req.ifr_addr.sin6_family = libc::AF_INET6 as libc::sa_family_t;
-        req.ifr_addr.sin6_len    = std::mem::size_of::<libc::sockaddr_in6>() as u8;
-        req.ifr_addr.sin6_addr   = libc::in6_addr { s6_addr: addr.octets() };
+        unsafe {
+            let mut req: In6IfreqDel = std::mem::zeroed();
+            copy_ifname(&mut req.ifr_name, name);
+            req.ifr_addr.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            req.ifr_addr.sin6_len    = std::mem::size_of::<libc::sockaddr_in6>() as u8;
+            req.ifr_addr.sin6_addr   = libc::in6_addr { s6_addr: addr.octets() };
 
-        let fd = open_sock6()?;
-        let ret = libc::ioctl(fd, SIOCDIFADDR_IN6, &req);
-        libc::close(fd);
-        ensure!(ret >= 0, "SIOCDIFADDR_IN6: {}", std::io::Error::last_os_error());
-        Ok(())
+            let fd = open_sock6()?;
+            let ret = libc::ioctl(fd, SIOCDIFADDR_IN6, &req);
+            libc::close(fd);
+            ensure!(ret >= 0, "SIOCDIFADDR_IN6: {}", std::io::Error::last_os_error());
+            Ok(())
+        }
     }
 }
 
