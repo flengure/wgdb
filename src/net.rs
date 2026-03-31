@@ -337,7 +337,8 @@ pub async fn flush_addresses(_handle: &Handle, index: u32) -> Result<()> {
         }
         let Some(addr) = entry.address else { continue };
         if let Some(sin) = addr.as_sockaddr_in() {
-            let v4 = std::net::Ipv4Addr::from(u32::from_be(sin.ip()));
+            // nix 0.29: SockaddrIn::ip() already returns Ipv4Addr
+            let v4 = sin.ip();
             unsafe {
                 macos_ioctl::del_addr_v4(&name, v4)
                     .context("SIOCDIFADDR")?;
@@ -665,9 +666,10 @@ pub async fn set_mtu(_handle: &Handle, index: u32, mtu: u32) -> Result<()> {
             InterfaceIndex: index,
             ..Default::default()
         };
-        GetIpInterfaceEntry(&mut row).context("GetIpInterfaceEntry")?;
+        // WIN32_ERROR doesn't impl AnyhowContext directly — call .ok() first.
+        GetIpInterfaceEntry(&mut row).ok().context("GetIpInterfaceEntry")?;
         row.NlMtu = mtu;
-        SetIpInterfaceEntry(&mut row).context("SetIpInterfaceEntry")?;
+        SetIpInterfaceEntry(&mut row).ok().context("SetIpInterfaceEntry")?;
     }
     tracing::debug!("net: set MTU {mtu} on index {index}");
     Ok(())
@@ -723,7 +725,8 @@ pub async fn add_address(_handle: &Handle, index: u32, cidr: &str) -> Result<()>
             }
         }
 
-        match AddUnicastIpAddressEntry(&row) {
+        // AddUnicastIpAddressEntry returns WIN32_ERROR, not Result — call .ok() first.
+        match AddUnicastIpAddressEntry(&row).ok() {
             Ok(()) => {
                 tracing::debug!("net: added {cidr} to index {index}");
                 Ok(())
@@ -749,7 +752,7 @@ pub async fn flush_addresses(_handle: &Handle, index: u32) -> Result<()> {
 
     unsafe {
         let mut table: *mut MIB_UNICASTIPADDRESS_TABLE = std::ptr::null_mut();
-        GetUnicastIpAddressTable(AF_UNSPEC, &mut table).context("GetUnicastIpAddressTable")?;
+        GetUnicastIpAddressTable(AF_UNSPEC, &mut table).ok().context("GetUnicastIpAddressTable")?;
 
         let count = (*table).NumEntries as usize;
         let rows = std::slice::from_raw_parts((*table).Table.as_ptr(), count);
@@ -770,21 +773,22 @@ pub async fn flush_addresses(_handle: &Handle, index: u32) -> Result<()> {
 pub async fn link_index(_handle: &Handle, name: &str) -> Result<Option<u32>> {
     use windows::Win32::NetworkManagement::IpHelper::{
         ConvertInterfaceAliasToLuid, ConvertInterfaceLuidToIndex,
-        NET_LUID_LH,
     };
+    // NET_LUID_LH lives in the Ndis module, not IpHelper.
+    use windows::Win32::NetworkManagement::Ndis::NET_LUID_LH;
 
     let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
     let mut luid = NET_LUID_LH::default();
     unsafe {
-        match ConvertInterfaceAliasToLuid(
+        // ConvertInterfaceAliasToLuid returns WIN32_ERROR, not Result.
+        if ConvertInterfaceAliasToLuid(
             windows::core::PCWSTR(wide.as_ptr()),
             &mut luid,
-        ) {
-            Ok(()) => {}
-            Err(_) => return Ok(None), // interface not found
+        ).is_err() {
+            return Ok(None); // interface not found
         }
         let mut idx = 0u32;
-        ConvertInterfaceLuidToIndex(&luid, &mut idx).context("ConvertInterfaceLuidToIndex")?;
+        ConvertInterfaceLuidToIndex(&luid, &mut idx).ok().context("ConvertInterfaceLuidToIndex")?;
         Ok(Some(idx))
     }
 }
