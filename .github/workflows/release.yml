@@ -27,12 +27,15 @@ jobs:
             artifact: wgdb
             binary: wgdb-linux-arm64
 
+          # Both macOS builds run on the ARM runner (macos-13 is deprecated).
+          # Cross-compiling x86_64-apple-darwin from an ARM host works because
+          # Apple ships a universal SDK and Rust supports the target natively.
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: wgdb
             binary: wgdb-macos-arm64
 
-          - os: macos-13
+          - os: macos-latest
             target: x86_64-apple-darwin
             artifact: wgdb
             binary: wgdb-macos-x64
@@ -66,8 +69,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ matrix.os }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
-          restore-keys: ${{ matrix.os }}-cargo-
+          key: ${{ matrix.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: ${{ matrix.os }}-${{ matrix.target }}-cargo-
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
@@ -79,9 +82,13 @@ jobs:
         if: runner.os == 'macOS'
         run: codesign --sign - --force --preserve-metadata=entitlements,requirements,flags,runtime target/${{ matrix.target }}/release/${{ matrix.artifact }}
 
-      - name: Rename artifact (Unix)
+      # Unix binaries are packaged as .tar.gz to preserve the execute bit.
+      # Windows binaries are uploaded as plain .exe (no equivalent needed).
+      - name: Package artifact (Unix)
         if: runner.os != 'Windows'
-        run: mv target/${{ matrix.target }}/release/${{ matrix.artifact }} ${{ matrix.binary }}
+        run: |
+          mv target/${{ matrix.target }}/release/${{ matrix.artifact }} ${{ matrix.binary }}
+          tar czf ${{ matrix.binary }}.tar.gz ${{ matrix.binary }}
 
       - name: Rename artifact (Windows)
         if: runner.os == 'Windows'
@@ -100,4 +107,8 @@ jobs:
             --generate-notes \
             --title "${{ github.ref_name }}" \
             2>/dev/null || true
-          gh release upload "${{ github.ref_name }}" ${{ matrix.binary }} --clobber
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            gh release upload "${{ github.ref_name }}" ${{ matrix.binary }} --clobber
+          else
+            gh release upload "${{ github.ref_name }}" ${{ matrix.binary }}.tar.gz --clobber
+          fi
