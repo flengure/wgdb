@@ -676,13 +676,13 @@ pub async fn set_mtu(_handle: &Handle, index: u32, mtu: u32) -> Result<()> {
 }
 
 /// Add a unicast IP address (CIDR) to a Windows interface via
-/// `AddUnicastIpAddressEntry`.
+/// `CreateUnicastIpAddressEntry`.
 ///
 /// Idempotent — `ERROR_OBJECT_ALREADY_EXISTS` is silently ignored.
 #[cfg(windows)]
 pub async fn add_address(_handle: &Handle, index: u32, cidr: &str) -> Result<()> {
     use windows::Win32::NetworkManagement::IpHelper::{
-        AddUnicastIpAddressEntry, MIB_UNICASTIPADDRESS_ROW,
+        CreateUnicastIpAddressEntry, MIB_UNICASTIPADDRESS_ROW,
         InitializeUnicastIpAddressEntry,
     };
     use windows::Win32::Networking::WinSock::{
@@ -725,8 +725,8 @@ pub async fn add_address(_handle: &Handle, index: u32, cidr: &str) -> Result<()>
             }
         }
 
-        // AddUnicastIpAddressEntry returns WIN32_ERROR, not Result — call .ok() first.
-        match AddUnicastIpAddressEntry(&row).ok() {
+        // CreateUnicastIpAddressEntry returns WIN32_ERROR, not Result — call .ok() first.
+        match CreateUnicastIpAddressEntry(&row).ok() {
             Ok(()) => {
                 tracing::debug!("net: added {cidr} to index {index}");
                 Ok(())
@@ -736,7 +736,7 @@ pub async fn add_address(_handle: &Handle, index: u32, cidr: &str) -> Result<()>
             {
                 Ok(()) // already assigned
             }
-            Err(e) => Err(e).context(format!("AddUnicastIpAddressEntry({cidr})")),
+            Err(e) => Err(e).context(format!("CreateUnicastIpAddressEntry({cidr})")),
         }
     }
 }
