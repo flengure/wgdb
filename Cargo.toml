@@ -51,10 +51,14 @@ nix  = { version = "0.29", features = ["net"] }
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
+    "Win32_System_IO",
+    "Win32_System_Services",
 ] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 base64       = "0.22"
+getrandom    = "0.2"
 
 # ── Release profile ───────────────────────────────────────────────────────────
 

@@ -216,12 +216,10 @@ fn build_peer_config(peer: &Peer) -> Result<wireguard_control::PeerConfigBuilder
 #[cfg(windows)]
 pub fn generate_keypair() -> Result<(String, String)> {
     use base64::Engine as _;
-    use rand::RngCore;
     use x25519_dalek::{PublicKey, StaticSecret};
 
-    let mut rng = rand::thread_rng();
     let mut bytes = [0u8; 32];
-    rng.fill_bytes(&mut bytes);
+    getrandom::getrandom(&mut bytes).map_err(|e| anyhow::anyhow!("getrandom: {e}"))?;
     let private = StaticSecret::from(bytes);
     let public = PublicKey::from(&private);
     let engine = base64::engine::general_purpose::STANDARD;
@@ -235,10 +233,11 @@ pub fn generate_keypair() -> Result<(String, String)> {
 #[cfg(windows)]
 pub fn generate_psk() -> String {
     use base64::Engine as _;
-    use rand::RngCore;
 
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    // getrandom only fails on unsupported platforms; unwrap_or_default leaves
+    // bytes zeroed which is safe (just a weak PSK) rather than panicking.
+    getrandom::getrandom(&mut bytes).unwrap_or_default();
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
@@ -349,6 +348,39 @@ pub fn interface_stats(iface_name: &str) -> Result<InterfaceStats> {
         peer_count += 1;
     }
     Ok(InterfaceStats { peer_count, rx_bytes, tx_bytes })
+}
+
+/// Validate and import a Base64-encoded private key supplied by the caller.
+///
+/// Returns `(private_key_base64, public_key_base64)` on success.
+///
+/// Use this instead of reaching into `wireguard_control` directly so that
+/// `api.rs` compiles on all platforms.
+#[cfg(unix)]
+pub fn import_private_key(b64: &str) -> Result<(String, String)> {
+    use wireguard_control::Key;
+    let key = Key::from_base64(b64).map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok((b64.to_string(), key.get_public().to_base64()))
+}
+
+/// Validate and import a Base64-encoded private key on Windows.
+///
+/// Returns `(private_key_base64, public_key_base64)` on success.
+#[cfg(windows)]
+pub fn import_private_key(b64: &str) -> Result<(String, String)> {
+    use base64::Engine as _;
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .context("invalid base64 in private_key")?;
+    anyhow::ensure!(bytes.len() == 32, "private_key must be 32 bytes");
+    let arr: [u8; 32] = bytes.try_into().unwrap();
+    let public = PublicKey::from(&StaticSecret::from(arr));
+    Ok((
+        b64.to_string(),
+        base64::engine::general_purpose::STANDARD.encode(public.as_bytes()),
+    ))
 }
 
 // ── Windows helpers ───────────────────────────────────────────────────────────

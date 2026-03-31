@@ -185,9 +185,7 @@ async fn create_interface(
     // Generate or import keypair
     let (private_b64, public_b64) = match body.private_key {
         Some(ref pk) => {
-            let priv_key =
-                wireguard_control::Key::from_base64(pk).map_err(|_| bad_request("invalid private_key"))?;
-            (pk.clone(), priv_key.get_public().to_base64())
+            wg::import_private_key(pk).map_err(|_| bad_request("invalid private_key"))?
         }
         None => tokio::task::spawn_blocking(wg::generate_keypair).await??,
     };
