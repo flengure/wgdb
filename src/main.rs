@@ -5,6 +5,7 @@ mod net;
 mod wg;
 
 use anyhow::{Context, Result};
+use clap::Parser;
 use db::Db;
 use rtnetlink::new_connection;
 use std::sync::Arc;
@@ -87,6 +88,24 @@ impl utoipa::Modify for BearerSecurityAddon {
     }
 }
 
+// ── CLI args ──────────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+#[command(about = "WireGuard VPN management daemon")]
+struct Args {
+    /// Path to the SQLite database file
+    #[arg(default_value = "wgdb.db")]
+    database: String,
+
+    /// Address and port to listen on
+    #[arg(default_value = "127.0.0.1:51800")]
+    address: String,
+
+    /// Admin bearer token
+    #[arg(long, env = "WGDB_ADMIN_TOKEN", default_value = "changeme")]
+    admin_token: String,
+}
+
 // ── App state ─────────────────────────────────────────────────────────────────
 
 pub struct AppState {
@@ -101,20 +120,18 @@ pub struct AppState {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    let args: Vec<String> = std::env::args().collect();
-    let db_path     = args.get(1).map(|s| s.as_str()).unwrap_or("wgdb.db");
-    let bind        = args.get(2).map(|s| s.as_str()).unwrap_or("127.0.0.1:51800");
-    let admin_token = std::env::var("WGDB_ADMIN_TOKEN")
-        .unwrap_or_else(|_| "changeme".to_string());
+    let args = Args::parse();
+    let db_path     = args.database.as_str();
+    let bind        = args.address.as_str();
+    let admin_token = args.admin_token;
 
     tracing::info!("wgdb: db={db_path} bind={bind}");
 
-    if let Some(parent) = std::path::Path::new(db_path).parent() {
-        if !parent.as_os_str().is_empty() {
+    if let Some(parent) = std::path::Path::new(db_path).parent()
+        && !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create directory {}", parent.display()))?;
         }
-    }
 
     let db = db::open(db_path).context("open db")?;
 
