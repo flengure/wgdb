@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use std::sync::{Arc, Mutex};
 
 pub type Db = Arc<Mutex<Connection>>;
@@ -16,9 +16,7 @@ pub fn open(path: &str) -> Result<Db> {
 }
 
 fn migrate(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);",
-    )?;
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);")?;
 
     // Collapse any duplicate rows (can happen if seed script and init binary both ran).
     // Take the MAX version seen, delete all rows, re-insert one canonical row.
@@ -146,79 +144,79 @@ ALTER TABLE peers_new RENAME TO peers;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct Interface {
-    pub id:          i64,
-    pub name:        String,
+    pub id: i64,
+    pub name: String,
     #[serde(skip_serializing)]
     pub private_key: String,
-    pub pubkey:      String,
+    pub pubkey: String,
     pub listen_port: i64,
-    pub address_v4:  Option<String>,
-    pub address_v6:  Option<String>,
-    pub mtu:         Option<i64>,
-    pub dns:         Option<String>,
-    pub endpoint:    Option<String>,
+    pub address_v4: Option<String>,
+    pub address_v6: Option<String>,
+    pub mtu: Option<i64>,
+    pub dns: Option<String>,
+    pub endpoint: Option<String>,
     pub allowed_ips: Option<String>,
-    pub enabled:     bool,
-    pub updated:     i64,
+    pub enabled: bool,
+    pub updated: i64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct Principal {
-    pub id:       i64,
+    pub id: i64,
     pub identity: String,
-    pub label:    Option<String>,
-    pub status:   String,
-    pub created:  i64,
+    pub label: Option<String>,
+    pub status: String,
+    pub created: i64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct Peer {
-    pub id:           i64,
+    pub id: i64,
     pub principal_id: i64,
-    pub iface_id:     i64,
-    pub pubkey:       String,
-    pub psk:          Option<String>,
-    pub ipv4:         Option<String>,
-    pub ipv6:         Option<String>,
-    pub label:        Option<String>,
-    pub created:      i64,
-    pub last_seen:    Option<i64>,
-    pub status:       String,
+    pub iface_id: i64,
+    pub pubkey: String,
+    pub psk: Option<String>,
+    pub ipv4: Option<String>,
+    pub ipv6: Option<String>,
+    pub label: Option<String>,
+    pub created: i64,
+    pub last_seen: Option<i64>,
+    pub status: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct Token {
-    pub id:           i64,
-    pub token:        String,
+    pub id: i64,
+    pub token: String,
     pub principal_id: i64,
-    pub iface_id:     i64,
-    pub uses_left:    Option<i64>,
-    pub expires:      Option<i64>,
-    pub created:      i64,
+    pub iface_id: i64,
+    pub uses_left: Option<i64>,
+    pub expires: Option<i64>,
+    pub created: i64,
 }
 
 pub struct NewInterface {
-    pub name:        String,
+    pub name: String,
     pub private_key: String,
-    pub pubkey:      String,
+    pub pubkey: String,
     pub listen_port: i64,
-    pub address_v4:  Option<String>,
-    pub address_v6:  Option<String>,
-    pub mtu:         Option<i64>,
-    pub dns:         Option<String>,
-    pub endpoint:    Option<String>,
+    pub address_v4: Option<String>,
+    pub address_v6: Option<String>,
+    pub mtu: Option<i64>,
+    pub dns: Option<String>,
+    pub endpoint: Option<String>,
     pub allowed_ips: Option<String>,
-    pub enabled:     bool,
+    pub enabled: bool,
 }
 
 pub struct NewPeer {
     pub principal_id: i64,
-    pub iface_id:     i64,
-    pub pubkey:       String,
-    pub psk:          Option<String>,
-    pub ipv4:         Option<String>,
-    pub ipv6:         Option<String>,
-    pub label:        Option<String>,
+    pub iface_id: i64,
+    pub pubkey: String,
+    pub psk: Option<String>,
+    pub ipv4: Option<String>,
+    pub ipv6: Option<String>,
+    pub label: Option<String>,
 }
 
 // ── Interface queries ─────────────────────────────────────────────────────────
@@ -252,7 +250,10 @@ pub fn get_interface_by_id(db: &Db, id: i64) -> Result<Option<Interface>> {
                 address_v4, address_v6, mtu, dns, endpoint, allowed_ips, enabled, updated
          FROM interfaces WHERE id = ?1",
     )?;
-    Ok(stmt.query_map(params![id], row_to_interface)?.next().transpose()?)
+    Ok(stmt
+        .query_map(params![id], row_to_interface)?
+        .next()
+        .transpose()?)
 }
 
 pub fn insert_interface(db: &Db, iface: &NewInterface) -> Result<Interface> {
@@ -263,9 +264,17 @@ pub fn insert_interface(db: &Db, iface: &NewInterface) -> Result<Interface> {
               mtu, dns, endpoint, allowed_ips, enabled)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
         params![
-            iface.name, iface.private_key, iface.pubkey, iface.listen_port,
-            iface.address_v4, iface.address_v6, iface.mtu, iface.dns,
-            iface.endpoint, iface.allowed_ips, iface.enabled as i64,
+            iface.name,
+            iface.private_key,
+            iface.pubkey,
+            iface.listen_port,
+            iface.address_v4,
+            iface.address_v6,
+            iface.mtu,
+            iface.dns,
+            iface.endpoint,
+            iface.allowed_ips,
+            iface.enabled as i64,
         ],
     )?;
     let id = conn.last_insert_rowid();
@@ -290,9 +299,15 @@ pub fn update_interface(db: &Db, iface: &Interface) -> Result<bool> {
              enabled=?10, updated=unixepoch()
          WHERE id=?11",
         params![
-            iface.private_key, iface.pubkey, iface.listen_port,
-            iface.address_v4, iface.address_v6, iface.mtu,
-            iface.dns, iface.endpoint, iface.allowed_ips,
+            iface.private_key,
+            iface.pubkey,
+            iface.listen_port,
+            iface.address_v4,
+            iface.address_v6,
+            iface.mtu,
+            iface.dns,
+            iface.endpoint,
+            iface.allowed_ips,
             iface.enabled as i64,
             iface.id,
         ],
@@ -305,19 +320,25 @@ pub fn update_interface(db: &Db, iface: &Interface) -> Result<bool> {
 pub fn delete_interface(db: &Db, name: &str) -> Result<Option<Vec<String>>> {
     let conn = db.lock().unwrap();
     let iface_id: Option<i64> = conn
-        .query_row("SELECT id FROM interfaces WHERE name = ?1", params![name], |r| r.get(0))
+        .query_row(
+            "SELECT id FROM interfaces WHERE name = ?1",
+            params![name],
+            |r| r.get(0),
+        )
         .optional()?;
     let iface_id = match iface_id {
         None => return Ok(None),
         Some(id) => id,
     };
-    let mut stmt = conn.prepare(
-        "SELECT pubkey FROM peers WHERE iface_id = ?1 AND status = 'active'",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT pubkey FROM peers WHERE iface_id = ?1 AND status = 'active'")?;
     let pubkeys: Vec<String> = stmt
         .query_map(params![iface_id], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
-    conn.execute("UPDATE peers SET status='revoked' WHERE iface_id=?1", params![iface_id])?;
+    conn.execute(
+        "UPDATE peers SET status='revoked' WHERE iface_id=?1",
+        params![iface_id],
+    )?;
     conn.execute("DELETE FROM tokens WHERE iface_id=?1", params![iface_id])?;
     conn.execute("DELETE FROM interfaces WHERE id=?1", params![iface_id])?;
     Ok(Some(pubkeys))
@@ -325,19 +346,19 @@ pub fn delete_interface(db: &Db, name: &str) -> Result<Option<Vec<String>>> {
 
 fn row_to_interface(r: &rusqlite::Row) -> rusqlite::Result<Interface> {
     Ok(Interface {
-        id:          r.get(0)?,
-        name:        r.get(1)?,
+        id: r.get(0)?,
+        name: r.get(1)?,
         private_key: r.get(2)?,
-        pubkey:      r.get(3)?,
+        pubkey: r.get(3)?,
         listen_port: r.get(4)?,
-        address_v4:  r.get(5)?,
-        address_v6:  r.get(6)?,
-        mtu:         r.get(7)?,
-        dns:         r.get(8)?,
-        endpoint:    r.get(9)?,
+        address_v4: r.get(5)?,
+        address_v6: r.get(6)?,
+        mtu: r.get(7)?,
+        dns: r.get(8)?,
+        endpoint: r.get(9)?,
         allowed_ips: r.get(10)?,
-        enabled:     r.get::<_, i64>(11)? != 0,
-        updated:     r.get(12)?,
+        enabled: r.get::<_, i64>(11)? != 0,
+        updated: r.get(12)?,
     })
 }
 
@@ -345,25 +366,31 @@ fn row_to_interface(r: &rusqlite::Row) -> rusqlite::Result<Interface> {
 
 pub fn list_principals(db: &Db) -> Result<Vec<Principal>> {
     let conn = db.lock().unwrap();
-    let mut stmt = conn.prepare(
-        "SELECT id, identity, label, status, created FROM principals ORDER BY created",
-    )?;
+    let mut stmt = conn
+        .prepare("SELECT id, identity, label, status, created FROM principals ORDER BY created")?;
     let rows = stmt.query_map([], row_to_principal)?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 pub fn get_principal(db: &Db, id: i64) -> Result<Option<Principal>> {
     let conn = db.lock().unwrap();
-    let mut stmt = conn.prepare(
-        "SELECT id, identity, label, status, created FROM principals WHERE id = ?1",
-    )?;
-    Ok(stmt.query_map(params![id], row_to_principal)?.next().transpose()?)
+    let mut stmt =
+        conn.prepare("SELECT id, identity, label, status, created FROM principals WHERE id = ?1")?;
+    Ok(stmt
+        .query_map(params![id], row_to_principal)?
+        .next()
+        .transpose()?)
 }
 
 /// Insert or ignore a principal by identity, returning its id.
 /// If `explicit_id` is provided it is used as the row id (preserves parity with portal.db).
 /// If the identity already exists the existing id is returned (idempotent).
-pub fn upsert_principal(db: &Db, explicit_id: Option<i64>, identity: &str, label: Option<&str>) -> Result<i64> {
+pub fn upsert_principal(
+    db: &Db,
+    explicit_id: Option<i64>,
+    identity: &str,
+    label: Option<&str>,
+) -> Result<i64> {
     let conn = db.lock().unwrap();
     if let Some(id) = explicit_id {
         conn.execute(
@@ -403,9 +430,8 @@ pub fn update_principal_status(db: &Db, id: i64, status: &str) -> Result<bool> {
 
 pub fn delete_principal(db: &Db, id: i64) -> Result<Vec<String>> {
     let conn = db.lock().unwrap();
-    let mut stmt = conn.prepare(
-        "SELECT pubkey FROM peers WHERE principal_id = ?1 AND status = 'active'",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT pubkey FROM peers WHERE principal_id = ?1 AND status = 'active'")?;
     let pubkeys: Vec<String> = stmt
         .query_map(params![id], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
@@ -421,11 +447,11 @@ pub fn delete_principal(db: &Db, id: i64) -> Result<Vec<String>> {
 
 fn row_to_principal(r: &rusqlite::Row) -> rusqlite::Result<Principal> {
     Ok(Principal {
-        id:       r.get(0)?,
+        id: r.get(0)?,
         identity: r.get(1)?,
-        label:    r.get(2)?,
-        status:   r.get(3)?,
-        created:  r.get(4)?,
+        label: r.get(2)?,
+        status: r.get(3)?,
+        created: r.get(4)?,
     })
 }
 
@@ -508,8 +534,13 @@ pub fn insert_peer(db: &Db, peer: &NewPeer) -> Result<i64> {
         "INSERT INTO peers (principal_id, iface_id, pubkey, psk, ipv4, ipv6, label)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
-            peer.principal_id, peer.iface_id, peer.pubkey,
-            peer.psk, peer.ipv4, peer.ipv6, peer.label,
+            peer.principal_id,
+            peer.iface_id,
+            peer.pubkey,
+            peer.psk,
+            peer.ipv4,
+            peer.ipv6,
+            peer.label,
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -544,17 +575,17 @@ pub fn update_peer_last_seen(db: &Db, pubkey: &str, ts: i64) -> Result<()> {
 
 fn row_to_peer(r: &rusqlite::Row) -> rusqlite::Result<Peer> {
     Ok(Peer {
-        id:           r.get(0)?,
+        id: r.get(0)?,
         principal_id: r.get(1)?,
-        iface_id:     r.get(2)?,
-        pubkey:       r.get(3)?,
-        psk:          r.get(4)?,
-        ipv4:         r.get(5)?,
-        ipv6:         r.get(6)?,
-        label:        r.get(7)?,
-        created:      r.get(8)?,
-        last_seen:    r.get(9)?,
-        status:       r.get(10)?,
+        iface_id: r.get(2)?,
+        pubkey: r.get(3)?,
+        psk: r.get(4)?,
+        ipv4: r.get(5)?,
+        ipv6: r.get(6)?,
+        label: r.get(7)?,
+        created: r.get(8)?,
+        last_seen: r.get(9)?,
+        status: r.get(10)?,
     })
 }
 
@@ -614,9 +645,10 @@ pub fn consume_token(db: &Db, token: &str) -> Result<Option<(i64, i64)>> {
 
     // Check expiry
     if let Some(exp) = expires
-        && now > exp {
-            return Ok(None);
-        }
+        && now > exp
+    {
+        return Ok(None);
+    }
 
     // Check and decrement uses_left
     if let Some(uses) = uses_left {
@@ -644,13 +676,13 @@ pub fn delete_token(db: &Db, token: &str) -> Result<bool> {
 
 fn row_to_token(r: &rusqlite::Row) -> rusqlite::Result<Token> {
     Ok(Token {
-        id:           r.get(0)?,
-        token:        r.get(1)?,
+        id: r.get(0)?,
+        token: r.get(1)?,
         principal_id: r.get(2)?,
-        iface_id:     r.get(3)?,
-        uses_left:    r.get(4)?,
-        expires:      r.get(5)?,
-        created:      r.get(6)?,
+        iface_id: r.get(3)?,
+        uses_left: r.get(4)?,
+        expires: r.get(5)?,
+        created: r.get(6)?,
     })
 }
 
