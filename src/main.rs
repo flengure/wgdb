@@ -182,10 +182,10 @@ async fn main() -> Result<()> {
     let mut iface_names: Vec<String> = Vec::new();
     for iface in &ifaces {
         iface_names.push(iface.name.clone());
-        if iface.enabled {
-            if let Err(e) = api::bring_up_interface(&handle, &db, iface).await {
-                tracing::warn!("wgdb: failed to bring up {}: {e:#}", iface.name);
-            }
+        if iface.enabled
+            && let Err(e) = api::bring_up_interface(&handle, &db, iface).await
+        {
+            tracing::warn!("wgdb: failed to bring up {}: {e:#}", iface.name);
         }
     }
 
