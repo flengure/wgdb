@@ -32,7 +32,7 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -42,7 +42,7 @@ jobs:
       # Cache the Cargo registry and compiled deps between runs to keep
       # build times short on subsequent pushes.
       - name: Cache Cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -69,8 +69,17 @@ jobs:
             target/${{ matrix.target }}/release/${{ matrix.artifact }} `
             wgdb-${{ matrix.target }}.exe
 
+      # Use the gh CLI (pre-installed on all GitHub runners, no Node.js
+      # dependency) to create the release and upload assets.
+      # Three jobs run in parallel — only one will win the creation race;
+      # the others will get a "release already exists" error which we ignore.
       - name: Upload to GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: wgdb-${{ matrix.target }}*
-          generate_release_notes: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --generate-notes \
+            --title "${{ github.ref_name }}" \
+            2>/dev/null || true
+          gh release upload "${{ github.ref_name }}" wgdb-${{ matrix.target }}* --clobber
