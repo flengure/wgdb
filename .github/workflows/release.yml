@@ -1,0 +1,76 @@
+name: Release
+
+# Triggered by pushing a version tag, e.g. `git tag v0.2.0 && git push --tags`.
+# Builds native binaries on all three platforms and attaches them to a GitHub
+# Release that is created automatically.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write   # needed to create the GitHub Release and upload assets
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: wgdb
+
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: wgdb
+
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: wgdb.exe
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Cache the Cargo registry and compiled deps between runs to keep
+      # build times short on subsequent pushes.
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ matrix.os }}-cargo-
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      # Rename the binary to include the target triple so all three assets
+      # can coexist in the same GitHub Release.
+      - name: Rename artifact (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mv target/${{ matrix.target }}/release/${{ matrix.artifact }} \
+             wgdb-${{ matrix.target }}
+
+      - name: Rename artifact (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          Move-Item `
+            target/${{ matrix.target }}/release/${{ matrix.artifact }} `
+            wgdb-${{ matrix.target }}.exe
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: wgdb-${{ matrix.target }}*
+          generate_release_notes: true

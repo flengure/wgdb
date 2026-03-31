@@ -1,3 +1,22 @@
+//! wgdb — WireGuard VPN management daemon.
+//!
+//! Opens a SQLite database, creates a platform-specific network handle,
+//! brings up all enabled WireGuard interfaces found in the DB, then serves
+//! an HTTP REST API (admin routes protected by a bearer token, public
+//! `/v1/register` and `/v1/connect` routes for clients).
+//!
+//! A background task polls peer handshake timestamps every 30 seconds and
+//! writes them to the DB so the API can surface `last_seen`.
+//!
+//! # Usage
+//!
+//! ```text
+//! wgdb [OPTIONS] [DATABASE] [ADDRESS]
+//! ```
+//!
+//! See `--help` for full options.  The `WGDB_ADMIN_TOKEN` environment variable
+//! overrides the `--admin-token` flag.
+
 mod alloc;
 mod api;
 mod db;
@@ -7,10 +26,11 @@ mod wg;
 use anyhow::{Context, Result};
 use clap::Parser;
 use db::Db;
-use rtnetlink::new_connection;
 use std::sync::Arc;
 use utoipa::OpenApi;
 use utoipa_scalar::{Scalar, Servable};
+
+// ── OpenAPI schema ────────────────────────────────────────────────────────────
 
 #[derive(OpenApi)]
 #[openapi(
@@ -101,16 +121,21 @@ struct Args {
     #[arg(default_value = "127.0.0.1:51800")]
     address: String,
 
-    /// Admin bearer token
+    /// Admin bearer token (overridden by WGDB_ADMIN_TOKEN env var)
     #[arg(long, env = "WGDB_ADMIN_TOKEN", default_value = "changeme")]
     admin_token: String,
 }
 
 // ── App state ─────────────────────────────────────────────────────────────────
 
+/// Shared state injected into every Axum handler via [`Arc`].
 pub struct AppState {
-    pub db:          Db,
-    pub netlink:     rtnetlink::Handle,
+    /// Open SQLite database handle.
+    pub db: Db,
+    /// Platform-specific network handle (rtnetlink on Linux, wireguard-go
+    /// PIDs on macOS, unit struct on Windows).
+    pub netlink: net::Handle,
+    /// Bearer token that must be present on all admin API requests.
     pub admin_token: String,
 }
 
@@ -128,32 +153,49 @@ async fn main() -> Result<()> {
     tracing::info!("wgdb: db={db_path} bind={bind}");
 
     if let Some(parent) = std::path::Path::new(db_path).parent()
-        && !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create directory {}", parent.display()))?;
-        }
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create directory {}", parent.display()))?;
+    }
 
     let db = db::open(db_path).context("open db")?;
 
-    let (rtnetlink_conn, handle, _) = new_connection().context("rtnetlink")?;
-    tokio::spawn(rtnetlink_conn);
+    // ── Platform-specific network handle setup ────────────────────────────────
 
-    // Bring up all enabled interfaces
+    // On Linux we open an rtnetlink socket and spawn its event loop.
+    // On other platforms we create a lightweight handle (macOS: PID map,
+    // Windows: unit struct).
+    #[cfg(target_os = "linux")]
+    let handle = {
+        let (conn, handle, _) = rtnetlink::new_connection().context("rtnetlink")?;
+        tokio::spawn(conn);
+        handle
+    };
+
+    #[cfg(not(target_os = "linux"))]
+    let handle = net::Handle::new();
+
+    // ── Bring up all enabled interfaces ──────────────────────────────────────
+
     let ifaces = db::list_interfaces(&db)?;
     let mut iface_names: Vec<String> = Vec::new();
     for iface in &ifaces {
         iface_names.push(iface.name.clone());
-        if iface.enabled
-            && let Err(e) = api::bring_up_interface(&handle, &db, iface).await {
+        if iface.enabled {
+            if let Err(e) = api::bring_up_interface(&handle, &db, iface).await {
                 tracing::warn!("wgdb: failed to bring up {}: {e:#}", iface.name);
             }
+        }
     }
 
-    // Background handshake poller
+    // ── Background handshake poller ───────────────────────────────────────────
+
     let poll_db = db.clone();
     tokio::spawn(poll_handshakes(poll_db, iface_names));
 
-    // HTTP server — public routes + admin routes with bearer auth
+    // ── HTTP server ───────────────────────────────────────────────────────────
+
     let state = Arc::new(AppState { db, netlink: handle, admin_token });
 
     let public_routes = axum::Router::new()
@@ -185,6 +227,8 @@ async fn main() -> Result<()> {
 
 // ── Background poller ─────────────────────────────────────────────────────────
 
+/// Poll all active interfaces every 30 seconds for peer handshake timestamps
+/// and persist them to the DB (`peers.last_seen`).
 async fn poll_handshakes(db: Db, iface_names: Vec<String>) {
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
     loop {
@@ -206,9 +250,11 @@ async fn poll_handshakes(db: Db, iface_names: Vec<String>) {
 
 // ── Graceful shutdown ─────────────────────────────────────────────────────────
 
+/// Wait for Ctrl-C or, on Unix, SIGTERM; then let Axum drain in-flight requests.
 async fn shutdown_signal() {
     use tokio::signal;
-    let ctrl_c  = async { signal::ctrl_c().await.expect("ctrl+c") };
+    let ctrl_c = async { signal::ctrl_c().await.expect("ctrl+c") };
+
     #[cfg(unix)]
     let sigterm = async {
         signal::unix::signal(signal::unix::SignalKind::terminate())
@@ -216,7 +262,11 @@ async fn shutdown_signal() {
             .recv()
             .await;
     };
+
+    // Windows has no SIGTERM; use a future that never resolves so the
+    // `select!` below still compiles.
     #[cfg(not(unix))]
     let sigterm = std::future::pending::<()>();
+
     tokio::select! { _ = ctrl_c => {}, _ = sigterm => {} }
 }

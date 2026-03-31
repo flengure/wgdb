@@ -1143,7 +1143,7 @@ fn random_token() -> String {
 /// Bring up a WireGuard interface that already exists in the DB.
 /// Called on startup (main.rs) and after API creation.
 pub async fn bring_up_interface(
-    handle: &rtnetlink::Handle,
+    handle: &net::Handle,
     db: &db::Db,
     iface: &db::Interface,
 ) -> anyhow::Result<()> {

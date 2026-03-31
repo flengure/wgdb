@@ -2,27 +2,62 @@
 name = "wgdb"
 version = "0.1.0"
 edition = "2024"
+description = "WireGuard VPN management daemon — HTTP REST API backed by SQLite, talking to the WireGuard kernel module (Linux) or wireguard-go (macOS) or the WireGuard Windows service (Windows)."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/user/wgdb"
+keywords = ["wireguard", "vpn", "networking", "daemon"]
+categories = ["network-programming", "command-line-utilities"]
+
+# ── Dependencies common to all platforms ─────────────────────────────────────
 
 [dependencies]
-anyhow = "1.0.102"
-axum = "0.8.8"
-futures = "0.3.32"
-hex = "0.4.3"
-netlink-packet-route = "0.28"
-rand = "0.10.0"
-rtnetlink = "0.20.0"
-rusqlite = { version = "0.39.0", features = ["bundled"] }
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
-tokio = { version = "1.50.0", features = ["full"] }
-tower-http = { version = "0.6.8", features = ["auth"] }
-utoipa = { version = "5", features = ["axum_extras"] }
-utoipa-scalar = { version = "0.3", features = ["axum"] }
-tracing = "0.1.44"
+anyhow          = "1.0.102"
+axum            = "0.8.8"
+hex             = "0.4.3"
+rand            = "0.10.0"
+rusqlite        = { version = "0.39.0", features = ["bundled"] }
+serde           = { version = "1.0.228", features = ["derive"] }
+serde_json      = "1.0.149"
+tokio           = { version = "1.50.0", features = ["full"] }
+tower-http      = { version = "0.6.8", features = ["auth"] }
+utoipa          = { version = "5", features = ["axum_extras"] }
+utoipa-scalar   = { version = "0.3", features = ["axum"] }
+tracing         = "0.1.44"
 tracing-subscriber = "0.3.23"
+clap            = { version = "4.6.0", features = ["derive", "env"] }
+
+# ── Linux-only: rtnetlink for interface management ────────────────────────────
+
+[target.'cfg(target_os = "linux")'.dependencies]
+futures              = "0.3.32"
+rtnetlink            = "0.20.0"
+netlink-packet-route = "0.28"
+
+# ── Unix (Linux + macOS): wireguard-control for key generation and WG config ──
+# On Linux uses Backend::Kernel; on macOS uses Backend::Userspace (wireguard-go).
+
+[target.'cfg(unix)'.dependencies]
 wireguard-control = "1.7.1"
-clap = { version = "4.6.0", features = ["derive", "env"] }
+
+# ── macOS-only: libc for BSD ioctl interface management ───────────────────────
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+nix  = { version = "0.29", features = ["net"] }
+
+# ── Windows-only: WG UAPI over named pipe + Win32 IP Helper ──────────────────
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
+] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+base64       = "0.22"
+
+# ── Release profile ───────────────────────────────────────────────────────────
 
 [profile.release]
 strip = true
-lto = true
+lto   = true

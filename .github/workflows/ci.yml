@@ -1,0 +1,51 @@
+name: CI
+
+# Run on every push and pull request to catch compile errors early.
+# We type-check on all three platforms but skip tests since they require
+# kernel access (WireGuard netlink) that GitHub runners don't have.
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+
+          - os: macos-latest
+            target: aarch64-apple-darwin
+
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: clippy
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ matrix.os }}-cargo-
+
+      - name: cargo check
+        run: cargo check --target ${{ matrix.target }}
+
+      - name: cargo clippy
+        run: cargo clippy --target ${{ matrix.target }} -- -D warnings
