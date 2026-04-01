@@ -1,8 +1,7 @@
 name: CI
 
 # Run on every push and pull request to catch compile errors early.
-# We type-check on all three platforms but skip tests since they require
-# kernel access (WireGuard netlink) that GitHub runners don't have.
+# We type-check / vet on all six platforms.
 on:
   push:
     branches: ["main"]
@@ -15,46 +14,50 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
+            goarch: amd64
+            goos: linux
 
           - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
+            goarch: arm64
+            goos: linux
 
           - os: macos-latest
-            target: aarch64-apple-darwin
+            goarch: arm64
+            goos: darwin
 
           - os: macos-latest
-            target: x86_64-apple-darwin
+            goarch: amd64
+            goos: darwin
 
           - os: windows-latest
-            target: x86_64-pc-windows-msvc
+            goarch: amd64
+            goos: windows
 
           - os: windows-11-arm
-            target: aarch64-pc-windows-msvc
+            goarch: arm64
+            goos: windows
 
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
-          targets: ${{ matrix.target }}
-          components: clippy
+          go-version-file: go/go.mod
+          cache-dependency-path: go/go.sum
 
-      - name: Cache Cargo
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ matrix.os }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
-          restore-keys: ${{ matrix.os }}-cargo-
+      - name: go vet
+        working-directory: go
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: go vet ./...
 
-      - name: cargo check
-        run: cargo check --target ${{ matrix.target }}
-
-      - name: cargo clippy
-        run: cargo clippy --target ${{ matrix.target }} -- -D warnings
+      - name: go build
+        working-directory: go
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: go build ./...

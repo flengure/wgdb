@@ -3,3 +3,4 @@ CLAUDE.md
 *.db
 *.db-shm
 *.db-wal
+go/wgdb

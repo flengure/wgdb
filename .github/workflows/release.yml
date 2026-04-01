@@ -1,7 +1,7 @@
 name: Release
 
 # Triggered by pushing a version tag, e.g. `git tag v0.2.0 && git push --tags`.
-# Builds native binaries on all three platforms and attaches them to a GitHub
+# Builds native binaries on all six platforms and attaches them to a GitHub
 # Release that is created automatically.
 on:
   push:
@@ -18,91 +18,75 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            artifact: wgdb
+            goos: linux
+            goarch: amd64
             binary: wgdb-linux-x64
 
           - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            artifact: wgdb
+            goos: linux
+            goarch: arm64
             binary: wgdb-linux-arm64
 
-          # Both macOS builds run on the ARM runner (macos-13 is deprecated).
-          # Cross-compiling x86_64-apple-darwin from an ARM host works because
-          # Apple ships a universal SDK and Rust supports the target natively.
           - os: macos-latest
-            target: aarch64-apple-darwin
-            artifact: wgdb
+            goos: darwin
+            goarch: arm64
             binary: wgdb-macos-arm64
 
           - os: macos-latest
-            target: x86_64-apple-darwin
-            artifact: wgdb
+            goos: darwin
+            goarch: amd64
             binary: wgdb-macos-x64
 
           - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact: wgdb.exe
+            goos: windows
+            goarch: amd64
             binary: wgdb-windows-x64.exe
 
           - os: windows-11-arm
-            target: aarch64-pc-windows-msvc
-            artifact: wgdb.exe
+            goos: windows
+            goarch: arm64
             binary: wgdb-windows-arm64.exe
 
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
-          targets: ${{ matrix.target }}
-
-      # Cache the Cargo registry and compiled deps between runs to keep
-      # build times short on subsequent pushes.
-      - name: Cache Cargo
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ matrix.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
-          restore-keys: ${{ matrix.os }}-${{ matrix.target }}-cargo-
+          go-version-file: go/go.mod
+          cache-dependency-path: go/go.sum
 
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+        working-directory: go
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: go build -ldflags="-s -w" -o ${{ matrix.binary }} .
 
       # Ad-hoc sign macOS binaries so Gatekeeper does not delete them.
-      # This is not full notarization but prevents the "malware" prompt for
-      # binaries that are run directly (e.g. after xattr -d com.apple.quarantine).
       - name: Sign binary (macOS)
         if: runner.os == 'macOS'
-        run: codesign --sign - --force --preserve-metadata=entitlements,requirements,flags,runtime target/${{ matrix.target }}/release/${{ matrix.artifact }}
+        working-directory: go
+        run: codesign --sign - --force --preserve-metadata=entitlements,requirements,flags,runtime ${{ matrix.binary }}
 
       # Unix binaries are packaged as .tar.gz to preserve the execute bit.
       - name: Package artifact (Unix)
         if: runner.os != 'Windows'
-        run: |
-          mv target/${{ matrix.target }}/release/${{ matrix.artifact }} ${{ matrix.binary }}
-          tar czf ${{ matrix.binary }}.tar.gz ${{ matrix.binary }}
+        working-directory: go
+        run: tar czf ${{ matrix.binary }}.tar.gz ${{ matrix.binary }}
 
-      # Windows: wintun.dll is embedded in the exe at compile time (build.rs),
-      # so the release is a single self-contained .exe wrapped in a zip.
+      # Windows: single self-contained .exe wrapped in a zip.
       - name: Package artifact (Windows)
         if: runner.os == 'Windows'
+        working-directory: go
         shell: bash
-        run: |
-          mv target/${{ matrix.target }}/release/${{ matrix.artifact }} ${{ matrix.binary }}
-          zip ${{ matrix.binary }}.zip ${{ matrix.binary }}
+        run: zip ${{ matrix.binary }}.zip ${{ matrix.binary }}
 
-      # Use the gh CLI (pre-installed on all GitHub runners, no Node.js
-      # dependency) to create the release and upload assets.
-      # Six jobs run in parallel — only one will win the creation race;
-      # the others will get a "release already exists" error which we ignore.
       - name: Upload to GitHub Release
+        working-directory: go
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
