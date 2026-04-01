@@ -44,13 +44,11 @@ jobs:
             target: x86_64-pc-windows-msvc
             artifact: wgdb.exe
             binary: wgdb-windows-x64.exe
-            wg_arch: amd64
 
           - os: windows-11-arm
             target: aarch64-pc-windows-msvc
             artifact: wgdb.exe
             binary: wgdb-windows-arm64.exe
-            wg_arch: arm64
 
     runs-on: ${{ matrix.os }}
 
@@ -85,36 +83,20 @@ jobs:
         run: codesign --sign - --force --preserve-metadata=entitlements,requirements,flags,runtime target/${{ matrix.target }}/release/${{ matrix.artifact }}
 
       # Unix binaries are packaged as .tar.gz to preserve the execute bit.
-      # Windows binaries are uploaded as plain .exe (no equivalent needed).
       - name: Package artifact (Unix)
         if: runner.os != 'Windows'
         run: |
           mv target/${{ matrix.target }}/release/${{ matrix.artifact }} ${{ matrix.binary }}
           tar czf ${{ matrix.binary }}.tar.gz ${{ matrix.binary }}
 
-      # Windows: download the matching wireguard.dll from the wireguard-nt
-      # project and bundle it with the exe so users get a self-contained zip.
-      # The prebuilt-binaries-license allows redistribution alongside other
-      # software — the license text is included in the archive.
-      - name: Bundle wireguard.dll (Windows)
+      # Windows: wintun.dll is embedded in the exe at compile time (build.rs),
+      # so the release is a single self-contained .exe wrapped in a zip.
+      - name: Package artifact (Windows)
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          curl -fsSL https://download.wireguard.com/wireguard-nt/wireguard-nt-0.10.1.zip \
-            -o wireguard-nt.zip
-          unzip -j wireguard-nt.zip \
-            "wireguard-nt-0.10.1/bin/${{ matrix.wg_arch }}/wireguard.dll" \
-            "wireguard-nt-0.10.1/prebuilt-binaries-license.txt" \
-            -d wgdist/
-          mv target/${{ matrix.target }}/release/${{ matrix.artifact }} wgdist/wgdb.exe
-          cd wgdist && zip ../${{ matrix.binary }}.zip wgdb.exe wireguard.dll prebuilt-binaries-license.txt
-
-      # Unix: tar.gz preserves the execute bit.
-      - name: Package artifact (Unix)
-        if: runner.os != 'Windows'
-        run: |
           mv target/${{ matrix.target }}/release/${{ matrix.artifact }} ${{ matrix.binary }}
-          tar czf ${{ matrix.binary }}.tar.gz ${{ matrix.binary }}
+          zip ${{ matrix.binary }}.zip ${{ matrix.binary }}
 
       # Use the gh CLI (pre-installed on all GitHub runners, no Node.js
       # dependency) to create the release and upload assets.

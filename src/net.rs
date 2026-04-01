@@ -610,7 +610,7 @@ mod macos_ioctl {
 // Windows implementation — Win32 IP Helper API
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Create a WireGuard adapter via wireguard-nt and return its interface index.
+/// Create a WireGuard adapter via wintun and return its interface index.
 ///
 /// Idempotent — if an adapter with this name already exists (e.g. from a
 /// previous daemon run) it is reopened rather than recreated, preserving any
@@ -624,7 +624,7 @@ pub async fn create_link(_handle: &Handle, name: &str) -> Result<u32> {
     luid_to_index(luid).await
 }
 
-/// Delete a WireGuard adapter by dropping its wireguard-nt handle.
+/// Delete a WireGuard adapter by dropping its wintun handle.
 ///
 /// The kernel interface is torn down when the last handle is closed.
 #[cfg(windows)]
@@ -757,7 +757,7 @@ pub async fn flush_addresses(_handle: &Handle, index: u32) -> Result<()> {
     Ok(())
 }
 
-/// Convert a raw LUID value returned by wireguard-nt into a Win32 interface
+/// Convert a raw LUID value returned by wintun into a Win32 interface
 /// index suitable for use with `set_mtu`, `add_address`, etc.
 #[cfg(windows)]
 async fn luid_to_index(luid_val: u64) -> Result<u32> {

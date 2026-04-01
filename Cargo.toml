@@ -2,7 +2,7 @@
 name = "wgdb"
 version = "0.1.0"
 edition = "2024"
-description = "WireGuard VPN management daemon — HTTP REST API backed by SQLite, talking to the WireGuard kernel module (Linux) or wireguard-go (macOS) or the WireGuard Windows service (Windows)."
+description = "WireGuard VPN management daemon — HTTP REST API backed by SQLite, talking to the WireGuard kernel module (Linux) or wireguard-go (macOS) or wintun+boringtun (Windows)."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/user/wgdb"
 keywords = ["wireguard", "vpn", "networking", "daemon"]
@@ -45,11 +45,12 @@ wireguard-control = "1.7.1"
 libc = "0.2"
 nix  = { version = "0.29", features = ["net"] }
 
-# ── Windows-only: wireguard-nt kernel driver + Win32 IP Helper ───────────────
+# ── Windows-only: wintun TUN adapter + boringtun WireGuard protocol ──────────
 
 [target.'cfg(windows)'.dependencies]
-wireguard-nt = "0.5"
-ipnet        = "2"
+wintun   = "0.5"
+boringtun = { version = "0.7", default-features = false }
+ipnet    = "2"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",
@@ -57,9 +58,13 @@ windows = { version = "0.58", features = [
     "Win32_Networking_WinSock",
     "Win32_System_IO",
 ] }
-x25519-dalek = { version = "2", features = ["static_secrets"] }
-base64       = "0.22"
-getrandom    = "0.2"
+base64    = "0.22"
+getrandom = "0.2"
+
+[target.'cfg(windows)'.build-dependencies]
+# build.rs downloads wintun.dll for the right arch and sets WINTUN_DLL env var.
+# No extra crates needed — we use std::process::Command (curl/Invoke-WebRequest).
+
 
 # ── Release profile ───────────────────────────────────────────────────────────
 

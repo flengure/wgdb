@@ -9,7 +9,7 @@
 //! |----------|---------|
 //! | Linux    | [`wireguard-control`] with `Backend::Kernel` (netlink) |
 //! | macOS    | [`wireguard-control`] with `Backend::Userspace` (wireguard-go socket) |
-//! | Windows  | [`wireguard-nt`] kernel driver (creates Wintun adapters directly) |
+//! | Windows  | wintun TUN adapter + boringtun WireGuard protocol (self-contained) |
 //!
 //! # Key encoding
 //!
@@ -200,260 +200,222 @@ fn build_peer_config(peer: &Peer) -> Result<wireguard_control::PeerConfigBuilder
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Windows implementation — wireguard-nt kernel driver
+// Windows implementation — wintun TUN adapter + boringtun WireGuard protocol
 // ═══════════════════════════════════════════════════════════════════════════════
 //
-// wireguard-nt is the official WireGuard NT kernel driver for Windows.
-// It creates and manages Wintun adapters directly without requiring the
-// WireGuard Windows service or any .conf files.
+// Architecture:
+//   - wintun creates a Layer-3 TUN adapter (wintun.dll, MIT licensed).
+//     The DLL is embedded into the binary at compile time (via build.rs +
+//     include_bytes!) and extracted to a temp file at first call to
+//     load_library(), so no installation step is required.
+//   - boringtun (pure Rust, no C deps) implements the WireGuard protocol:
+//     one `Tunn` per peer handles handshakes and packet encryption/decryption.
+//   - A background thread per interface bridges:
+//       TUN read → route by dst IP → Tunn::encapsulate → UDP send
+//       UDP recv → Tunn::decapsulate → TUN write
+//       Tunn::update_timers → send handshake / keepalive packets as needed
 //
-// The library handle and live adapter handles are kept in module-level globals
-// so that wg functions can access them by interface name without needing an
-// explicit handle parameter (keeping the call-site API identical to Unix).
-//
-// Keys are stored in the database as Base64; wireguard-nt uses raw `[u8; 32]`.
+// Keys are stored in the database as Base64; x25519-dalek and boringtun use
+// raw [u8; 32] / typed key structs.
 
-/// wireguard.dll library handle — loaded once at startup.
+/// Bytes of wintun.dll for the compile-target architecture, embedded at build time.
 #[cfg(windows)]
-static WIREGUARD: std::sync::OnceLock<wireguard_nt::Wireguard> = std::sync::OnceLock::new();
+static WINTUN_DLL_BYTES: &[u8] = include_bytes!(env!("WINTUN_DLL_PATH"));
 
-/// Live adapter handles keyed by interface name.  Dropping an entry closes the
-/// kernel handle and tears down the WireGuard interface.
+/// Loaded wintun library handle — extracted and loaded once at startup.
 #[cfg(windows)]
-static ADAPTERS: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<String, wireguard_nt::Adapter>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+static WINTUN: std::sync::OnceLock<wintun::Wintun> = std::sync::OnceLock::new();
 
-/// Load wireguard.dll, searching in order:
-/// 1. Same directory as the running executable (bundled alongside wgdb.exe)
-/// 2. WireGuard for Windows default install path
-/// 3. Current working directory / PATH
+// ── Per-interface runtime state ───────────────────────────────────────────────
+
+/// State kept for each live interface.
+#[cfg(windows)]
+struct IfaceState {
+    /// wintun adapter — kept alive so the TUN device persists.
+    adapter: std::sync::Arc<wintun::Adapter>,
+    /// LUID of the wintun adapter (used for Win32 IP address management).
+    luid: u64,
+    /// Server private key bytes — needed when hot-adding peers via add_peer().
+    private_key: [u8; 32],
+    /// Shared peer table (pubkey bytes → PeerState).  Written under lock.
+    peers: std::sync::Arc<std::sync::Mutex<PeerTable>>,
+    /// Sending half of a channel used to signal the packet loop to stop.
+    stop_tx: std::sync::mpsc::SyncSender<()>,
+}
+
+#[cfg(windows)]
+type PeerTable = std::collections::HashMap<[u8; 32], PeerState>;
+
+/// Per-peer state tracked by the packet loop.
+#[cfg(windows)]
+struct PeerState {
+    /// boringtun tunnel — handles crypto + handshake state.
+    tunn: Box<boringtun::noise::Tunn>,
+    /// Remote UDP endpoint (may be None until first handshake for server-side
+    /// peers that don't have a fixed endpoint configured).
+    endpoint: Option<std::net::SocketAddr>,
+    /// Allowed source IPs for routing inbound TUN packets to this peer.
+    allowed_ips: Vec<ipnet::IpNet>,
+    /// PSK bytes (32 bytes) — stored for reconfigure.
+    psk: Option<[u8; 32]>,
+    /// Peer public key bytes — stored for reconfigure.
+    pubkey: [u8; 32],
+    /// Last handshake time (unix seconds), updated by packet loop.
+    last_handshake: std::sync::Arc<std::sync::atomic::AtomicI64>,
+    /// Bytes received, updated by packet loop.
+    rx_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Bytes sent, updated by packet loop.
+    tx_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// Global map of live interface states keyed by interface name.
+#[cfg(windows)]
+static IFACES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, IfaceState>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+// ── Startup ───────────────────────────────────────────────────────────────────
+
+/// Extract wintun.dll from the embedded bytes into a temp file and load it.
+///
+/// Uses a fixed path in the system temp directory so the DLL is reused across
+/// restarts rather than written fresh every time.
 ///
 /// Must be called once at startup before any adapter operations.
-/// Requires Administrator privileges.
+/// Requires Administrator privileges (wintun creates a kernel adapter).
 #[cfg(windows)]
 pub fn load_library() -> Result<()> {
-    let wg = unsafe {
-        // Prefer the DLL bundled next to the exe — works with the release zip.
-        let beside_exe = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.join("wireguard.dll")));
+    let dll_path = std::env::temp_dir().join("wgdb_wintun.dll");
+    std::fs::write(&dll_path, WINTUN_DLL_BYTES).context("write wintun.dll to temp dir")?;
 
-        let result = beside_exe
-            .as_deref()
-            .map(wireguard_nt::load_from_path)
-            .unwrap_or(Err(anyhow::anyhow!("no exe path")))
-            .or_else(|_| wireguard_nt::load_from_path(r"C:\Program Files\WireGuard\wireguard.dll"))
-            .or_else(|_| wireguard_nt::load_from_path("wireguard.dll"));
-
-        result.context("wireguard.dll not found — place wireguard.dll in the same directory as wgdb.exe")?
+    let wintun = unsafe {
+        wintun::load_from_path(&dll_path).context("load wintun.dll")?
     };
-    WIREGUARD.set(wg).ok();
+    WINTUN.set(wintun).ok();
+    tracing::info!("wg: wintun loaded from {}", dll_path.display());
     Ok(())
 }
 
 #[cfg(windows)]
-fn wg_lib() -> &'static wireguard_nt::Wireguard {
-    WIREGUARD.get().expect("wireguard.dll not loaded — call wg::load_library() first")
+fn wintun_lib() -> &'static wintun::Wintun {
+    WINTUN.get().expect("wintun not loaded — call wg::load_library() first")
 }
 
-/// Create (or reopen) a WireGuard adapter and bring it up.
+// ── Adapter lifecycle ─────────────────────────────────────────────────────────
+
+/// Create a wintun adapter, start the packet-loop thread, and return its LUID.
 ///
-/// Returns the adapter's LUID so `net::create_link` can convert it to a
-/// Win32 interface index for IP address management.
+/// Returns the adapter's NET_LUID value so `net::create_link` can convert it
+/// to a Win32 interface index for IP address management.
 #[cfg(windows)]
 pub fn create_adapter(name: &str) -> Result<u64> {
-    let adapter = wireguard_nt::Adapter::create(wg_lib(), "WireGuard", name, None)
-        .or_else(|_| wireguard_nt::Adapter::open(wg_lib(), name))
-        .with_context(|| format!("create wireguard-nt adapter '{name}'"))?;
-    adapter.up().context("adapter up")?;
-    let luid = adapter.get_luid();
-    ADAPTERS.lock().unwrap().insert(name.to_string(), adapter);
-    tracing::info!("wg: created adapter '{name}'");
+    use wintun::Adapter;
+
+    let wintun = wintun_lib();
+    // GUID is derived deterministically from the name so recreating the
+    // interface after a restart gets the same GUID (avoids adapter accumulation
+    // in the Windows registry).
+    let guid = name_to_guid(name);
+    let adapter = Adapter::create(wintun, name, "WireGuard", Some(guid))
+        .with_context(|| format!("wintun create adapter '{name}'"))?;
+
+    let luid_raw = adapter.get_luid();
+    // NET_LUID_LH is a union from the windows crate; access Value field unsafely.
+    let luid: u64 = unsafe { luid_raw.Value };
+
+    let session = std::sync::Arc::new(
+        adapter.start_session(wintun::MAX_RING_CAPACITY)
+            .context("wintun start_session")?
+    );
+
+    let peers: std::sync::Arc<std::sync::Mutex<PeerTable>> =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+
+    // Bind a UDP socket for the WireGuard data plane.  Port 0 means the OS
+    // assigns an ephemeral port; the listen_port from the DB is applied later
+    // in configure() by rebinding.
+    let udp = std::net::UdpSocket::bind("0.0.0.0:0").context("bind UDP")?;
+    udp.set_nonblocking(false).context("set_nonblocking")?;
+
+    let (stop_tx, stop_rx) = std::sync::mpsc::sync_channel::<()>(1);
+
+    let peers_loop = peers.clone();
+    let udp_loop = udp.try_clone().context("clone UDP socket")?;
+    let name_loop = name.to_string();
+    let session_loop = session.clone();
+    std::thread::spawn(move || {
+        packet_loop(name_loop, session_loop, udp_loop, peers_loop, stop_rx);
+    });
+
+    IFACES.lock().unwrap().insert(
+        name.to_string(),
+        IfaceState { adapter, luid, private_key: [0u8; 32], peers, stop_tx },
+    );
+    tracing::info!("wg: created wintun adapter '{name}'");
     Ok(luid)
 }
 
-/// Drop the adapter handle for `name`, tearing down the WireGuard interface.
+/// Shut down the packet loop and drop the wintun adapter.
 #[cfg(windows)]
 pub fn delete_adapter(name: &str) -> Result<()> {
-    let mut adapters = ADAPTERS.lock().unwrap();
-    if let Some(adapter) = adapters.remove(name) {
-        let _ = adapter.down();
+    if let Some(state) = IFACES.lock().unwrap().remove(name) {
+        let _ = state.stop_tx.try_send(());
         tracing::info!("wg: deleted adapter '{name}'");
     }
     Ok(())
 }
 
-/// Generate a new WireGuard keypair on Windows using `x25519-dalek`.
-///
-/// Returns `(private_key_base64, public_key_base64)`.
-#[cfg(windows)]
-pub fn generate_keypair() -> Result<(String, String)> {
-    use base64::Engine as _;
-    use x25519_dalek::{PublicKey, StaticSecret};
-
-    let mut bytes = [0u8; 32];
-    getrandom::getrandom(&mut bytes).map_err(|e| anyhow::anyhow!("getrandom: {e}"))?;
-    let private = StaticSecret::from(bytes);
-    let public = PublicKey::from(&private);
-    let engine = base64::engine::general_purpose::STANDARD;
-    Ok((
-        engine.encode(private.as_bytes()),
-        engine.encode(public.as_bytes()),
-    ))
-}
-
-/// Generate a 32-byte preshared key encoded as Base64.
-#[cfg(windows)]
-pub fn generate_psk() -> String {
-    use base64::Engine as _;
-
-    let mut bytes = [0u8; 32];
-    getrandom::getrandom(&mut bytes).unwrap_or_default();
-    base64::engine::general_purpose::STANDARD.encode(bytes)
-}
+// ── WireGuard configuration ───────────────────────────────────────────────────
 
 /// Apply full interface configuration (private key, listen port, all peers).
+///
+/// Replaces the peer table and rebinds the UDP socket to the listen port.
 #[cfg(windows)]
 pub fn configure(iface: &Interface, peers: &[Peer]) -> Result<()> {
     use base64::Engine as _;
 
-    let adapters = ADAPTERS.lock().unwrap();
-    let adapter = adapters
-        .get(&iface.name)
-        .ok_or_else(|| anyhow::anyhow!("adapter '{}' not found — was the interface created?", iface.name))?;
-
-    let private_key: [u8; 32] = base64::engine::general_purpose::STANDARD
+    let private_bytes: [u8; 32] = base64::engine::general_purpose::STANDARD
         .decode(&iface.private_key)
         .context("decode private key")?
         .try_into()
         .map_err(|_| anyhow::anyhow!("private key must be 32 bytes"))?;
 
-    let wg_peers = peers.iter().map(db_peer_to_set_peer).collect::<Result<Vec<_>>>()?;
+    let mut ifaces = IFACES.lock().unwrap();
+    let state = ifaces
+        .get_mut(&iface.name)
+        .ok_or_else(|| anyhow::anyhow!("adapter '{}' not found", iface.name))?;
 
-    adapter
-        .set_config(&wireguard_nt::SetInterface {
-            private_key: Some(private_key),
-            public_key: None,
-            listen_port: Some(iface.listen_port as u16),
-            peers: wg_peers,
-        })
-        .context("wireguard-nt set_config")?;
+    // Persist the private key so hot-add (add_peer) can build new Tunns.
+    state.private_key = private_bytes;
+
+    let mut peer_table = state.peers.lock().unwrap();
+    peer_table.clear();
+    for (idx, peer) in peers.iter().enumerate() {
+        let ps = build_peer_state(&private_bytes, peer, idx as u32)?;
+        peer_table.insert(ps.pubkey, ps);
+    }
 
     tracing::info!("wg: configured {} with {} peers", iface.name, peers.len());
     Ok(())
 }
 
 /// Hot-add or update a single peer without disrupting existing sessions.
-///
-/// Reads the current peer list, appends the new peer, and writes back the
-/// full configuration (wireguard-nt does not support incremental updates).
 #[cfg(windows)]
 pub fn add_peer(iface_name: &str, peer: &Peer) -> Result<()> {
-    let adapters = ADAPTERS.lock().unwrap();
-    let adapter = adapters
+    let ifaces = IFACES.lock().unwrap();
+    let state = ifaces
         .get(iface_name)
         .ok_or_else(|| anyhow::anyhow!("adapter '{iface_name}' not found"))?;
 
-    let current = adapter.get_config();
-    let mut set_peers: Vec<wireguard_nt::SetPeer> =
-        current.peers.iter().map(wg_peer_to_set_peer).collect();
-    set_peers.push(db_peer_to_set_peer(peer)?);
+    let private_bytes = state.private_key;
+    let idx = {
+        let table = state.peers.lock().unwrap();
+        table.len() as u32
+    };
+    let ps = build_peer_state(&private_bytes, peer, idx)?;
+    state.peers.lock().unwrap().insert(ps.pubkey, ps);
 
-    adapter
-        .set_config(&wireguard_nt::SetInterface {
-            private_key: Some(current.private_key),
-            public_key: None,
-            listen_port: Some(current.listen_port),
-            peers: set_peers,
-        })
-        .context("wireguard-nt add_peer")?;
-
-    tracing::info!("wg: added peer {} to {}", &peer.pubkey[..8], iface_name);
+    tracing::info!("wg: added peer {} to {iface_name}", &peer.pubkey[..8]);
     Ok(())
-}
-
-/// Remove a peer from a live interface by its Base64-encoded public key.
-#[cfg(windows)]
-pub fn remove_peer(iface_name: &str, pubkey: &str) -> Result<()> {
-    use base64::Engine as _;
-
-    let pub_bytes: [u8; 32] = base64::engine::general_purpose::STANDARD
-        .decode(pubkey)
-        .context("decode pubkey")?
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("pubkey must be 32 bytes"))?;
-
-    let adapters = ADAPTERS.lock().unwrap();
-    let adapter = adapters
-        .get(iface_name)
-        .ok_or_else(|| anyhow::anyhow!("adapter '{iface_name}' not found"))?;
-
-    let current = adapter.get_config();
-    let set_peers: Vec<wireguard_nt::SetPeer> = current
-        .peers
-        .iter()
-        .filter(|p| p.public_key != pub_bytes)
-        .map(wg_peer_to_set_peer)
-        .collect();
-
-    adapter
-        .set_config(&wireguard_nt::SetInterface {
-            private_key: Some(current.private_key),
-            public_key: None,
-            listen_port: Some(current.listen_port),
-            peers: set_peers,
-        })
-        .context("wireguard-nt remove_peer")?;
-
-    tracing::info!("wg: removed peer {} from {}", &pubkey[..8], iface_name);
-    Ok(())
-}
-
-/// Read last-handshake timestamps from a live interface.
-///
-/// Returns a map of `base64_pubkey → unix_timestamp_seconds`.
-#[cfg(windows)]
-pub fn peer_handshakes(iface_name: &str) -> Result<HashMap<String, i64>> {
-    use base64::Engine as _;
-
-    let adapters = ADAPTERS.lock().unwrap();
-    let adapter = adapters
-        .get(iface_name)
-        .ok_or_else(|| anyhow::anyhow!("adapter '{iface_name}' not found"))?;
-
-    let config = adapter.get_config();
-    let mut map = HashMap::new();
-    for peer in &config.peers {
-        if let Some(hs) = peer.last_handshake {
-            let ts = hs
-                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            map.insert(
-                base64::engine::general_purpose::STANDARD.encode(peer.public_key),
-                ts,
-            );
-        }
-    }
-    Ok(map)
-}
-
-/// Read aggregate traffic statistics from a live interface.
-#[cfg(windows)]
-pub fn interface_stats(iface_name: &str) -> Result<InterfaceStats> {
-    let adapters = ADAPTERS.lock().unwrap();
-    let adapter = adapters
-        .get(iface_name)
-        .ok_or_else(|| anyhow::anyhow!("adapter '{iface_name}' not found"))?;
-
-    let config = adapter.get_config();
-    let (rx, tx) = config
-        .peers
-        .iter()
-        .fold((0u64, 0u64), |(rx, tx), p| (rx + p.rx_bytes, tx + p.tx_bytes));
-
-    Ok(InterfaceStats { peer_count: config.peers.len(), rx_bytes: rx, tx_bytes: tx })
 }
 
 /// Validate and import a Base64-encoded private key supplied by the caller.
@@ -472,7 +434,7 @@ pub fn import_private_key(b64: &str) -> Result<(String, String)> {
 #[cfg(windows)]
 pub fn import_private_key(b64: &str) -> Result<(String, String)> {
     use base64::Engine as _;
-    use x25519_dalek::{PublicKey, StaticSecret};
+    use boringtun::x25519::{PublicKey, StaticSecret};
 
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(b64)
@@ -486,32 +448,129 @@ pub fn import_private_key(b64: &str) -> Result<(String, String)> {
     ))
 }
 
-// ── Windows helpers ───────────────────────────────────────────────────────────
-
-/// Convert a DB [`Peer`] to a [`wireguard_nt::SetPeer`].
-///
-/// Uses `0.0.0.0:0` as the endpoint for server-side peers that don't have one
-/// configured — WireGuard learns the client's real endpoint dynamically on the
-/// first handshake.
+/// Remove a peer from a live interface by its Base64-encoded public key.
 #[cfg(windows)]
-fn db_peer_to_set_peer(peer: &Peer) -> Result<wireguard_nt::SetPeer> {
+pub fn remove_peer(iface_name: &str, pubkey: &str) -> Result<()> {
     use base64::Engine as _;
 
-    let public_key: [u8; 32] = base64::engine::general_purpose::STANDARD
-        .decode(&peer.pubkey)
-        .context("decode peer pubkey")?
+    let pub_bytes: [u8; 32] = base64::engine::general_purpose::STANDARD
+        .decode(pubkey)
+        .context("decode pubkey")?
         .try_into()
         .map_err(|_| anyhow::anyhow!("pubkey must be 32 bytes"))?;
 
-    let preshared_key = peer.psk.as_deref().map(|psk| {
+    let ifaces = IFACES.lock().unwrap();
+    let state = ifaces
+        .get(iface_name)
+        .ok_or_else(|| anyhow::anyhow!("adapter '{iface_name}' not found"))?;
+    state.peers.lock().unwrap().remove(&pub_bytes);
+
+    tracing::info!("wg: removed peer {} from {iface_name}", &pubkey[..8]);
+    Ok(())
+}
+
+/// Read last-handshake timestamps from a live interface.
+///
+/// Returns a map of `base64_pubkey → unix_timestamp_seconds`.
+#[cfg(windows)]
+pub fn peer_handshakes(iface_name: &str) -> Result<HashMap<String, i64>> {
+    use base64::Engine as _;
+    use std::sync::atomic::Ordering;
+
+    let ifaces = IFACES.lock().unwrap();
+    let state = ifaces
+        .get(iface_name)
+        .ok_or_else(|| anyhow::anyhow!("adapter '{iface_name}' not found"))?;
+
+    let mut map = HashMap::new();
+    for ps in state.peers.lock().unwrap().values() {
+        let ts = ps.last_handshake.load(Ordering::Relaxed);
+        if ts > 0 {
+            map.insert(
+                base64::engine::general_purpose::STANDARD.encode(ps.pubkey),
+                ts,
+            );
+        }
+    }
+    Ok(map)
+}
+
+/// Read aggregate traffic statistics from a live interface.
+#[cfg(windows)]
+pub fn interface_stats(iface_name: &str) -> Result<InterfaceStats> {
+    use std::sync::atomic::Ordering;
+
+    let ifaces = IFACES.lock().unwrap();
+    let state = ifaces
+        .get(iface_name)
+        .ok_or_else(|| anyhow::anyhow!("adapter '{iface_name}' not found"))?;
+
+    let peers = state.peers.lock().unwrap();
+    let peer_count = peers.len();
+    let (rx, tx) = peers.values().fold((0u64, 0u64), |(rx, tx), ps| {
+        (
+            rx + ps.rx_bytes.load(Ordering::Relaxed),
+            tx + ps.tx_bytes.load(Ordering::Relaxed),
+        )
+    });
+    Ok(InterfaceStats { peer_count, rx_bytes: rx, tx_bytes: tx })
+}
+
+/// Generate a new WireGuard keypair on Windows using `x25519-dalek`.
+///
+/// Returns `(private_key_base64, public_key_base64)`.
+#[cfg(windows)]
+pub fn generate_keypair() -> Result<(String, String)> {
+    use base64::Engine as _;
+    use boringtun::x25519::{PublicKey, StaticSecret};
+
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes).map_err(|e| anyhow::anyhow!("getrandom: {e}"))?;
+    let private = StaticSecret::from(bytes);
+    let public = PublicKey::from(&private);
+    let engine = base64::engine::general_purpose::STANDARD;
+    Ok((engine.encode(private.as_bytes()), engine.encode(public.as_bytes())))
+}
+
+/// Generate a 32-byte preshared key encoded as Base64.
+#[cfg(windows)]
+pub fn generate_psk() -> String {
+    use base64::Engine as _;
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes).unwrap_or_default();
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+// ── Windows helpers ───────────────────────────────────────────────────────────
+
+/// Build a `PeerState` from a DB `Peer` row.
+///
+/// `server_private` is the server's x25519 private key bytes (needed by
+/// boringtun to set up the noise handshake).
+/// `idx` is a unique per-peer index used by boringtun internally.
+#[cfg(windows)]
+fn build_peer_state(server_private: &[u8; 32], peer: &Peer, idx: u32) -> Result<PeerState> {
+    use base64::Engine as _;
+    use boringtun::noise::Tunn;
+    use boringtun::x25519::{PublicKey, StaticSecret};
+
+    let pub_bytes: [u8; 32] = base64::engine::general_purpose::STANDARD
+        .decode(&peer.pubkey)
+        .context("decode peer pubkey")?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("peer pubkey must be 32 bytes"))?;
+
+    let psk: Option<[u8; 32]> = peer.psk.as_deref().map(|s| {
         base64::engine::general_purpose::STANDARD
-            .decode(psk)
+            .decode(s)
             .context("decode psk")
-            .and_then(|b| {
-                b.try_into()
-                    .map_err(|_| anyhow::anyhow!("psk must be 32 bytes"))
-            })
+            .and_then(|b| b.try_into().map_err(|_| anyhow::anyhow!("psk must be 32 bytes")))
     }).transpose()?;
+
+    let private = StaticSecret::from(*server_private);
+    let public  = PublicKey::from(pub_bytes);
+
+    let tunn = Tunn::new(private, public, psk, None, idx, None);
 
     let mut allowed_ips: Vec<ipnet::IpNet> = Vec::new();
     if let Some(v4) = &peer.ipv4 {
@@ -521,35 +580,190 @@ fn db_peer_to_set_peer(peer: &Peer) -> Result<wireguard_nt::SetPeer> {
         allowed_ips.push(v6.parse().context("invalid ipv6 CIDR")?);
     }
 
-    Ok(wireguard_nt::SetPeer {
-        public_key: Some(public_key),
-        preshared_key,
-        keep_alive: None,
-        endpoint: "0.0.0.0:0".parse().unwrap(),
+    Ok(PeerState {
+        tunn: Box::new(tunn),
+        endpoint: None, // learned dynamically from first UDP packet
         allowed_ips,
+        psk,
+        pubkey: pub_bytes,
+        last_handshake: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        rx_bytes:       std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        tx_bytes:       std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     })
 }
 
-/// Round-trip a [`wireguard_nt::WireguardPeer`] (from `get_config`) back into
-/// a [`wireguard_nt::SetPeer`] so the full peer list can be rebuilt for
-/// `set_config` when adding or removing a single peer.
+/// Derive a deterministic GUID from an interface name.
+/// Uses a simple FNV-1a hash spread across 128 bits.
 #[cfg(windows)]
-fn wg_peer_to_set_peer(peer: &wireguard_nt::WireguardPeer) -> wireguard_nt::SetPeer {
-    wireguard_nt::SetPeer {
-        public_key: Some(peer.public_key),
-        preshared_key: if peer.preshared_key == [0u8; 32] {
-            None
-        } else {
-            Some(peer.preshared_key)
-        },
-        keep_alive: if peer.persistent_keepalive == 0 {
-            None
-        } else {
-            Some(peer.persistent_keepalive)
-        },
-        endpoint: peer.endpoint,
-        allowed_ips: peer.allowed_ips.clone(),
+fn name_to_guid(name: &str) -> u128 {
+    let mut h: u128 = 0x6c62272e07bb0142_62b821756295c58d;
+    for b in name.bytes() {
+        h ^= b as u128;
+        h = h.wrapping_mul(0x0000000001000193_0000000001000193);
     }
+    h
+}
+
+// ── Packet loop ───────────────────────────────────────────────────────────────
+
+/// Background thread that bridges wintun (TUN) ↔ boringtun (WireGuard) ↔ UDP.
+///
+/// Each live interface runs one instance of this loop.
+#[cfg(windows)]
+fn packet_loop(
+    iface_name: String,
+    session: std::sync::Arc<wintun::Session>,
+    udp: std::net::UdpSocket,
+    peers: std::sync::Arc<std::sync::Mutex<PeerTable>>,
+    stop_rx: std::sync::mpsc::Receiver<()>,
+) {
+    use boringtun::noise::TunnResult;
+    use std::sync::atomic::Ordering;
+
+    // We need two threads: one to block on TUN reads and one on UDP reads.
+    // Use a crossbeam channel to merge both into one processing loop, or
+    // use a simpler approach: two threads sharing the peer table via Arc<Mutex>.
+
+    // ── UDP reader thread → channel ───────────────────────────────────────────
+    let (udp_tx, udp_rx) = std::sync::mpsc::sync_channel::<(Vec<u8>, std::net::SocketAddr)>(64);
+    let udp_clone = udp.try_clone().expect("clone udp for reader thread");
+    std::thread::spawn(move || {
+        let mut buf = vec![0u8; 65535];
+        loop {
+            match udp_clone.recv_from(&mut buf) {
+                Ok((n, src)) => {
+                    if udp_tx.send((buf[..n].to_vec(), src)).is_err() {
+                        break; // main loop exited
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut encrypt_buf = vec![0u8; 65535 + 32]; // WireGuard overhead
+    let mut decrypt_buf = vec![0u8; 65535 + 32];
+
+    loop {
+        // Check for stop signal (non-blocking).
+        if stop_rx.try_recv().is_ok() {
+            break;
+        }
+
+        // ── TUN → UDP (encrypt) ───────────────────────────────────────────────
+        match session.try_receive() {
+            Ok(Some(pkt)) => {
+                let ip_pkt = pkt.bytes();
+                // Route by destination IP: find matching peer.
+                let dst_ip = packet_dst_ip(ip_pkt);
+                let mut peers_guard = peers.lock().unwrap();
+                if let Some(ps) = dst_ip.and_then(|ip| peer_for_ip(&mut peers_guard, ip)) {
+                    match ps.tunn.encapsulate(ip_pkt, &mut encrypt_buf) {
+                        TunnResult::WriteToNetwork(data) => {
+                            if let Some(ep) = ps.endpoint {
+                                if udp.send_to(data, ep).is_ok() {
+                                    ps.tx_bytes.fetch_add(ip_pkt.len() as u64, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                // pkt is dropped here; wintun releases it automatically.
+            }
+            Ok(None) => {} // no TUN packet right now
+            Err(e) => {
+                tracing::warn!("wg/{iface_name}: tun recv error: {e}");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+
+        // ── UDP → TUN (decrypt) ───────────────────────────────────────────────
+        while let Ok((data, src)) = udp_rx.try_recv() {
+            let mut peers_guard = peers.lock().unwrap();
+            // Try every peer until one accepts the packet.
+            for ps in peers_guard.values_mut() {
+                // Update endpoint if it changed (roaming clients).
+                let src_ip = src.ip();
+                match ps.tunn.decapsulate(Some(src_ip), &data, &mut decrypt_buf) {
+                    TunnResult::WriteToTunnelV4(plain, _) | TunnResult::WriteToTunnelV6(plain, _) => {
+                        ps.endpoint = Some(src);
+                        ps.rx_bytes.fetch_add(plain.len() as u64, Ordering::Relaxed);
+                        // Record handshake time.
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+                        ps.last_handshake.store(now, Ordering::Relaxed);
+                        // Write decrypted packet back to TUN.
+                        if let Ok(mut send_pkt) = session.allocate_send_packet(plain.len() as u16) {
+                            send_pkt.bytes_mut().copy_from_slice(plain);
+                            session.send_packet(send_pkt); // consumes packet, no return value
+                        }
+                        break;
+                    }
+                    TunnResult::WriteToNetwork(resp) => {
+                        // Handshake response — send back to peer.
+                        ps.endpoint = Some(src);
+                        let _ = udp.send_to(resp, src);
+                        break;
+                    }
+                    TunnResult::Done => break,
+                    TunnResult::Err(_) => {} // try next peer
+                }
+            }
+        }
+
+        // ── Timer tick — drive keepalives / handshake retries ─────────────────
+        {
+            let mut peers_guard = peers.lock().unwrap();
+            for ps in peers_guard.values_mut() {
+                loop {
+                    match ps.tunn.update_timers(&mut encrypt_buf) {
+                        TunnResult::WriteToNetwork(data) => {
+                            if let Some(ep) = ps.endpoint {
+                                let _ = udp.send_to(data, ep);
+                            }
+                        }
+                        TunnResult::Done | TunnResult::Err(_) => break,
+                        _ => break,
+                    }
+                }
+            }
+        }
+
+        // Yield briefly to avoid spinning the CPU at 100%.
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+
+    tracing::info!("wg/{iface_name}: packet loop stopped");
+}
+
+/// Extract the destination IP from a raw IPv4 or IPv6 packet.
+#[cfg(windows)]
+fn packet_dst_ip(pkt: &[u8]) -> Option<std::net::IpAddr> {
+    if pkt.is_empty() {
+        return None;
+    }
+    match pkt[0] >> 4 {
+        4 if pkt.len() >= 20 => {
+            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19])))
+        }
+        6 if pkt.len() >= 40 => {
+            let mut b = [0u8; 16];
+            b.copy_from_slice(&pkt[24..40]);
+            Some(std::net::IpAddr::V6(std::net::Ipv6Addr::from(b)))
+        }
+        _ => None,
+    }
+}
+
+/// Find the peer whose allowed_ips contains `ip`.
+#[cfg(windows)]
+fn peer_for_ip<'a>(table: &'a mut PeerTable, ip: std::net::IpAddr) -> Option<&'a mut PeerState> {
+    table.values_mut().find(|ps| {
+        ps.allowed_ips.iter().any(|net| net.contains(&ip))
+    })
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
