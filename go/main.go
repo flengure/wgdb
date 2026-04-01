@@ -19,17 +19,31 @@ func main() {
 	adminToken := flag.String("admin-token", "changeme", "admin bearer token (env: WGDB_ADMIN_TOKEN)")
 	flag.Parse()
 
-	// Positional args override flags (backwards compat with Rust CLI).
-	if args := flag.Args(); len(args) >= 1 {
-		*dbPath = args[0]
-	}
-	if args := flag.Args(); len(args) >= 2 {
-		*addr = args[1]
-	}
-
 	// Env var overrides flag.
 	if t := os.Getenv("WGDB_ADMIN_TOKEN"); t != "" {
 		*adminToken = t
+	}
+
+	// Check for service subcommands (Windows) or backwards-compat positional args.
+	args := flag.Args()
+	if len(args) > 0 {
+		if handleServiceCommand(args[0], *dbPath, *addr, *adminToken) {
+			return
+		}
+		// Positional args: backwards compat with Rust CLI.
+		*dbPath = args[0]
+		if len(args) >= 2 {
+			*addr = args[1]
+		}
+	}
+
+	// Running as a Windows service — hand off to service runner.
+	if isWindowsService() {
+		if err := initWintun(); err != nil {
+			fatalf("init wintun: %v", err)
+		}
+		runWindowsService(*dbPath, *addr, *adminToken)
+		return
 	}
 
 	checkPrivileges()
@@ -38,26 +52,36 @@ func main() {
 		fatalf("init wintun: %v", err)
 	}
 
-	slog.Info("wgdb starting", "db", *dbPath, "addr", *addr)
+	// Interactive mode — stop on OS signal.
+	stopCh := make(chan struct{})
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		close(stopCh)
+	}()
 
-	// Ensure parent directory exists.
-	if dir := filepath.Dir(*dbPath); dir != "" && dir != "." {
+	run(*dbPath, *addr, *adminToken, stopCh)
+}
+
+func run(dbPath, addr, adminToken string, stop <-chan struct{}) {
+	slog.Info("wgdb starting", "db", dbPath, "addr", addr)
+
+	if dir := filepath.Dir(dbPath); dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			fatalf("create db directory: %v", err)
 		}
 	}
 
-	db, err := openDB(*dbPath)
+	db, err := openDB(dbPath)
 	if err != nil {
 		fatalf("open db: %v", err)
 	}
 	defer db.Close()
 
 	wg := newWGManager()
+	state := &AppState{db: db, wg: wg, adminToken: adminToken}
 
-	state := &AppState{db: db, wg: wg, adminToken: *adminToken}
-
-	// Bring up all enabled interfaces.
 	ifaces, err := dbListInterfaces(db)
 	if err != nil {
 		fatalf("list interfaces: %v", err)
@@ -72,19 +96,13 @@ func main() {
 		}
 	}
 
-	// Background handshake poller.
 	go pollHandshakes(state, ifaceNames)
 
-	// HTTP server.
 	router := setupRouter(state)
-	srv := &http.Server{Addr: *addr, Handler: router}
-
-	// Graceful shutdown on signal.
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	srv := &http.Server{Addr: addr, Handler: router}
 
 	go func() {
-		slog.Info("wgdb listening", "addr", *addr)
+		slog.Info("wgdb listening", "addr", addr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			fatalf("listen: %v", err)
 		}
