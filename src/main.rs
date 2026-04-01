@@ -163,6 +163,11 @@ async fn main() -> Result<()> {
 
     // ── Platform-specific network handle setup ────────────────────────────────
 
+    // Windows: load wireguard.dll from the WireGuard for Windows installation.
+    // Requires Administrator privileges and WireGuard for Windows to be installed.
+    #[cfg(windows)]
+    wg::load_library().context("load wireguard.dll")?;
+
     // On Linux we open an rtnetlink socket and spawn its event loop.
     // On other platforms we create a lightweight handle (macOS: PID map,
     // Windows: unit struct).

@@ -9,7 +9,7 @@
 //! |----------|---------|
 //! | Linux    | [`wireguard-control`] with `Backend::Kernel` (netlink) |
 //! | macOS    | [`wireguard-control`] with `Backend::Userspace` (wireguard-go socket) |
-//! | Windows  | WireGuard UAPI text protocol over a named pipe (`\\.\pipe\WireGuard\<name>`) |
+//! | Windows  | [`wireguard-nt`] kernel driver (creates Wintun adapters directly) |
 //!
 //! # Key encoding
 //!
@@ -200,15 +200,75 @@ fn build_peer_config(peer: &Peer) -> Result<wireguard_control::PeerConfigBuilder
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Windows implementation — WireGuard UAPI text protocol over named pipe
+// Windows implementation — wireguard-nt kernel driver
 // ═══════════════════════════════════════════════════════════════════════════════
 //
-// The WireGuard UAPI protocol is a simple line-based text format documented at
-// https://www.wireguard.com/xplatform/.  On Windows the WireGuard service
-// exposes it over the named pipe `\\.\pipe\WireGuard\<interface>`.
+// wireguard-nt is the official WireGuard NT kernel driver for Windows.
+// It creates and manages Wintun adapters directly without requiring the
+// WireGuard Windows service or any .conf files.
 //
-// Keys in the UAPI protocol are 64-character hex strings.  The DB stores them
-// as Base64.  The `b64_to_hex` / `hex_to_b64` helpers convert between formats.
+// The library handle and live adapter handles are kept in module-level globals
+// so that wg functions can access them by interface name without needing an
+// explicit handle parameter (keeping the call-site API identical to Unix).
+//
+// Keys are stored in the database as Base64; wireguard-nt uses raw `[u8; 32]`.
+
+/// wireguard.dll library handle — loaded once at startup.
+#[cfg(windows)]
+static WIREGUARD: std::sync::OnceLock<wireguard_nt::Wireguard> = std::sync::OnceLock::new();
+
+/// Live adapter handles keyed by interface name.  Dropping an entry closes the
+/// kernel handle and tears down the WireGuard interface.
+#[cfg(windows)]
+static ADAPTERS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, wireguard_nt::Adapter>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Load wireguard.dll from the WireGuard for Windows installation directory.
+/// Must be called once at startup (before any adapter operations) and requires
+/// Administrator privileges.
+#[cfg(windows)]
+pub fn load_library() -> Result<()> {
+    let wg = unsafe {
+        wireguard_nt::load_from_path(r"C:\Program Files\WireGuard\wireguard.dll")
+            .or_else(|_| wireguard_nt::load_from_path("wireguard.dll"))
+            .context("load wireguard.dll — ensure WireGuard for Windows is installed and wgdb is running as Administrator")?
+    };
+    WIREGUARD.set(wg).ok(); // ignore "already initialised"
+    Ok(())
+}
+
+#[cfg(windows)]
+fn wg_lib() -> &'static wireguard_nt::Wireguard {
+    WIREGUARD.get().expect("wireguard.dll not loaded — call wg::load_library() first")
+}
+
+/// Create (or reopen) a WireGuard adapter and bring it up.
+///
+/// Returns the adapter's LUID so `net::create_link` can convert it to a
+/// Win32 interface index for IP address management.
+#[cfg(windows)]
+pub fn create_adapter(name: &str) -> Result<u64> {
+    let adapter = wireguard_nt::Adapter::create(wg_lib(), "WireGuard", name, None)
+        .or_else(|_| wireguard_nt::Adapter::open(wg_lib(), name))
+        .with_context(|| format!("create wireguard-nt adapter '{name}'"))?;
+    adapter.up().context("adapter up")?;
+    let luid = adapter.get_luid();
+    ADAPTERS.lock().unwrap().insert(name.to_string(), adapter);
+    tracing::info!("wg: created adapter '{name}'");
+    Ok(luid)
+}
+
+/// Drop the adapter handle for `name`, tearing down the WireGuard interface.
+#[cfg(windows)]
+pub fn delete_adapter(name: &str) -> Result<()> {
+    let mut adapters = ADAPTERS.lock().unwrap();
+    if let Some(adapter) = adapters.remove(name) {
+        let _ = adapter.down();
+        tracing::info!("wg: deleted adapter '{name}'");
+    }
+    Ok(())
+}
 
 /// Generate a new WireGuard keypair on Windows using `x25519-dalek`.
 ///
@@ -235,127 +295,156 @@ pub fn generate_psk() -> String {
     use base64::Engine as _;
 
     let mut bytes = [0u8; 32];
-    // getrandom only fails on unsupported platforms; unwrap_or_default leaves
-    // bytes zeroed which is safe (just a weak PSK) rather than panicking.
     getrandom::getrandom(&mut bytes).unwrap_or_default();
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
-/// Apply full interface configuration via the WireGuard Windows named pipe.
+/// Apply full interface configuration (private key, listen port, all peers).
 #[cfg(windows)]
 pub fn configure(iface: &Interface, peers: &[Peer]) -> Result<()> {
-    let mut msg = format!(
-        "set=1\nprivate_key={}\nlisten_port={}\nreplace_peers=true\n",
-        b64_to_hex(&iface.private_key)?,
-        iface.listen_port,
-    );
-    for peer in peers {
-        msg.push_str(&peer_uapi_block(peer)?);
-    }
-    // Terminate the set command with a blank line.
-    msg.push('\n');
-    uapi_set(&iface.name, &msg)?;
+    use base64::Engine as _;
+
+    let adapters = ADAPTERS.lock().unwrap();
+    let adapter = adapters
+        .get(&iface.name)
+        .ok_or_else(|| anyhow::anyhow!("adapter '{}' not found — was the interface created?", iface.name))?;
+
+    let private_key: [u8; 32] = base64::engine::general_purpose::STANDARD
+        .decode(&iface.private_key)
+        .context("decode private key")?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("private key must be 32 bytes"))?;
+
+    let wg_peers = peers.iter().map(db_peer_to_set_peer).collect::<Result<Vec<_>>>()?;
+
+    adapter
+        .set_config(&wireguard_nt::SetInterface {
+            private_key: Some(private_key),
+            public_key: None,
+            listen_port: Some(iface.listen_port as u16),
+            peers: wg_peers,
+        })
+        .context("wireguard-nt set_config")?;
+
     tracing::info!("wg: configured {} with {} peers", iface.name, peers.len());
     Ok(())
 }
 
-/// Hot-add or update a single peer via the named pipe.
+/// Hot-add or update a single peer without disrupting existing sessions.
+///
+/// Reads the current peer list, appends the new peer, and writes back the
+/// full configuration (wireguard-nt does not support incremental updates).
 #[cfg(windows)]
 pub fn add_peer(iface_name: &str, peer: &Peer) -> Result<()> {
-    let mut msg = format!("set=1\n{}", peer_uapi_block(peer)?);
-    msg.push('\n');
-    uapi_set(iface_name, &msg)?;
+    let adapters = ADAPTERS.lock().unwrap();
+    let adapter = adapters
+        .get(iface_name)
+        .ok_or_else(|| anyhow::anyhow!("adapter '{iface_name}' not found"))?;
+
+    let current = adapter.get_config();
+    let mut set_peers: Vec<wireguard_nt::SetPeer> =
+        current.peers.iter().map(wg_peer_to_set_peer).collect();
+    set_peers.push(db_peer_to_set_peer(peer)?);
+
+    adapter
+        .set_config(&wireguard_nt::SetInterface {
+            private_key: Some(current.private_key),
+            public_key: None,
+            listen_port: Some(current.listen_port),
+            peers: set_peers,
+        })
+        .context("wireguard-nt add_peer")?;
+
     tracing::info!("wg: added peer {} to {}", &peer.pubkey[..8], iface_name);
     Ok(())
 }
 
-/// Remove a peer by public key via the named pipe.
+/// Remove a peer from a live interface by its Base64-encoded public key.
 #[cfg(windows)]
 pub fn remove_peer(iface_name: &str, pubkey: &str) -> Result<()> {
-    let msg = format!(
-        "set=1\npublic_key={}\nremove=true\n\n",
-        b64_to_hex(pubkey)?
-    );
-    uapi_set(iface_name, &msg)?;
+    use base64::Engine as _;
+
+    let pub_bytes: [u8; 32] = base64::engine::general_purpose::STANDARD
+        .decode(pubkey)
+        .context("decode pubkey")?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("pubkey must be 32 bytes"))?;
+
+    let adapters = ADAPTERS.lock().unwrap();
+    let adapter = adapters
+        .get(iface_name)
+        .ok_or_else(|| anyhow::anyhow!("adapter '{iface_name}' not found"))?;
+
+    let current = adapter.get_config();
+    let set_peers: Vec<wireguard_nt::SetPeer> = current
+        .peers
+        .iter()
+        .filter(|p| p.public_key != pub_bytes)
+        .map(wg_peer_to_set_peer)
+        .collect();
+
+    adapter
+        .set_config(&wireguard_nt::SetInterface {
+            private_key: Some(current.private_key),
+            public_key: None,
+            listen_port: Some(current.listen_port),
+            peers: set_peers,
+        })
+        .context("wireguard-nt remove_peer")?;
+
     tracing::info!("wg: removed peer {} from {}", &pubkey[..8], iface_name);
     Ok(())
 }
 
-/// Read last-handshake timestamps from the named pipe.
+/// Read last-handshake timestamps from a live interface.
 ///
 /// Returns a map of `base64_pubkey → unix_timestamp_seconds`.
 #[cfg(windows)]
 pub fn peer_handshakes(iface_name: &str) -> Result<HashMap<String, i64>> {
-    let response = uapi_get(iface_name)?;
-    let mut map = HashMap::new();
-    let mut current_key: Option<String> = None;
-    let mut last_hs: i64 = 0;
+    use base64::Engine as _;
 
-    for line in response.lines() {
-        if let Some(hex) = line.strip_prefix("public_key=") {
-            // Flush the previous peer's handshake if we had one.
-            if let Some(key) = current_key.take()
-                && last_hs != 0
-            {
-                map.insert(key, last_hs);
-            }
-            current_key = Some(hex_to_b64(hex)?);
-            last_hs = 0;
-        } else if let Some(ts) = line.strip_prefix("last_handshake_time_sec=") {
-            last_hs = ts.parse().unwrap_or(0);
+    let adapters = ADAPTERS.lock().unwrap();
+    let adapter = adapters
+        .get(iface_name)
+        .ok_or_else(|| anyhow::anyhow!("adapter '{iface_name}' not found"))?;
+
+    let config = adapter.get_config();
+    let mut map = HashMap::new();
+    for peer in &config.peers {
+        if let Some(hs) = peer.last_handshake {
+            let ts = hs
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            map.insert(
+                base64::engine::general_purpose::STANDARD.encode(peer.public_key),
+                ts,
+            );
         }
-    }
-    // Flush last peer.
-    if let Some(key) = current_key
-        && last_hs != 0
-    {
-        map.insert(key, last_hs);
     }
     Ok(map)
 }
 
-/// Read aggregate traffic statistics from the named pipe.
+/// Read aggregate traffic statistics from a live interface.
 #[cfg(windows)]
 pub fn interface_stats(iface_name: &str) -> Result<InterfaceStats> {
-    let response = uapi_get(iface_name)?;
-    let mut peer_count = 0usize;
-    let mut rx_bytes = 0u64;
-    let mut tx_bytes = 0u64;
-    let mut in_peer = false;
-    let mut peer_rx = 0u64;
-    let mut peer_tx = 0u64;
+    let adapters = ADAPTERS.lock().unwrap();
+    let adapter = adapters
+        .get(iface_name)
+        .ok_or_else(|| anyhow::anyhow!("adapter '{iface_name}' not found"))?;
 
-    for line in response.lines() {
-        if line.starts_with("public_key=") {
-            if in_peer {
-                // Flush previous peer.
-                rx_bytes += peer_rx;
-                tx_bytes += peer_tx;
-                peer_count += 1;
-            }
-            in_peer = true;
-            peer_rx = 0;
-            peer_tx = 0;
-        } else if let Some(v) = line.strip_prefix("rx_bytes=") {
-            peer_rx = v.parse().unwrap_or(0);
-        } else if let Some(v) = line.strip_prefix("tx_bytes=") {
-            peer_tx = v.parse().unwrap_or(0);
-        }
-    }
-    if in_peer {
-        rx_bytes += peer_rx;
-        tx_bytes += peer_tx;
-        peer_count += 1;
-    }
-    Ok(InterfaceStats { peer_count, rx_bytes, tx_bytes })
+    let config = adapter.get_config();
+    let (rx, tx) = config
+        .peers
+        .iter()
+        .fold((0u64, 0u64), |(rx, tx), p| (rx + p.rx_bytes, tx + p.tx_bytes));
+
+    Ok(InterfaceStats { peer_count: config.peers.len(), rx_bytes: rx, tx_bytes: tx })
 }
 
 /// Validate and import a Base64-encoded private key supplied by the caller.
 ///
 /// Returns `(private_key_base64, public_key_base64)` on success.
-///
-/// Use this instead of reaching into `wireguard_control` directly so that
-/// `api.rs` compiles on all platforms.
 #[cfg(unix)]
 pub fn import_private_key(b64: &str) -> Result<(String, String)> {
     use wireguard_control::Key;
@@ -385,77 +474,68 @@ pub fn import_private_key(b64: &str) -> Result<(String, String)> {
 
 // ── Windows helpers ───────────────────────────────────────────────────────────
 
-/// Send a UAPI GET request to the named pipe and return the full response.
-#[cfg(windows)]
-fn uapi_get(iface_name: &str) -> Result<String> {
-    use std::io::{Read, Write};
-
-    let path = format!(r"\\.\pipe\WireGuard\{iface_name}");
-    let mut pipe = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&path)
-        .with_context(|| format!("open WireGuard pipe for '{iface_name}'"))?;
-
-    pipe.write_all(b"get=1\n\n").context("write UAPI get")?;
-    let mut resp = String::new();
-    pipe.read_to_string(&mut resp).context("read UAPI response")?;
-    Ok(resp)
-}
-
-/// Send a UAPI SET request to the named pipe.
+/// Convert a DB [`Peer`] to a [`wireguard_nt::SetPeer`].
 ///
-/// `payload` must be a complete, newline-terminated UAPI set block ending
-/// with a blank line.
+/// Uses `0.0.0.0:0` as the endpoint for server-side peers that don't have one
+/// configured — WireGuard learns the client's real endpoint dynamically on the
+/// first handshake.
 #[cfg(windows)]
-fn uapi_set(iface_name: &str, payload: &str) -> Result<()> {
-    use std::io::Write;
-
-    let path = format!(r"\\.\pipe\WireGuard\{iface_name}");
-    let mut pipe = std::fs::OpenOptions::new()
-        .write(true)
-        .open(&path)
-        .with_context(|| format!("open WireGuard pipe for '{iface_name}'"))?;
-
-    pipe.write_all(payload.as_bytes())
-        .context("write UAPI set")?;
-    Ok(())
-}
-
-/// Build the UAPI text lines for a single peer.
-#[cfg(windows)]
-fn peer_uapi_block(peer: &Peer) -> Result<String> {
-    let mut s = format!("public_key={}\n", b64_to_hex(&peer.pubkey)?);
-
-    if let Some(psk) = &peer.psk {
-        s.push_str(&format!("preshared_key={}\n", b64_to_hex(psk)?));
-    }
-
-    if let Some(ipv4) = &peer.ipv4 {
-        s.push_str(&format!("allowed_ip={ipv4}\n"));
-    }
-    if let Some(ipv6) = &peer.ipv6 {
-        s.push_str(&format!("allowed_ip={ipv6}\n"));
-    }
-    Ok(s)
-}
-
-/// Convert a Base64-encoded 32-byte WireGuard key to its lowercase hex form.
-#[cfg(windows)]
-fn b64_to_hex(b64: &str) -> Result<String> {
+fn db_peer_to_set_peer(peer: &Peer) -> Result<wireguard_nt::SetPeer> {
     use base64::Engine as _;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(b64)
-        .context("base64 decode key")?;
-    Ok(hex::encode(bytes))
+
+    let public_key: [u8; 32] = base64::engine::general_purpose::STANDARD
+        .decode(&peer.pubkey)
+        .context("decode peer pubkey")?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("pubkey must be 32 bytes"))?;
+
+    let preshared_key = peer.psk.as_deref().map(|psk| {
+        base64::engine::general_purpose::STANDARD
+            .decode(psk)
+            .context("decode psk")
+            .and_then(|b| {
+                b.try_into()
+                    .map_err(|_| anyhow::anyhow!("psk must be 32 bytes"))
+            })
+    }).transpose()?;
+
+    let mut allowed_ips: Vec<ipnet::IpNet> = Vec::new();
+    if let Some(v4) = &peer.ipv4 {
+        allowed_ips.push(v4.parse().context("invalid ipv4 CIDR")?);
+    }
+    if let Some(v6) = &peer.ipv6 {
+        allowed_ips.push(v6.parse().context("invalid ipv6 CIDR")?);
+    }
+
+    Ok(wireguard_nt::SetPeer {
+        public_key: Some(public_key),
+        preshared_key,
+        keep_alive: None,
+        endpoint: "0.0.0.0:0".parse().unwrap(),
+        allowed_ips,
+    })
 }
 
-/// Convert a lowercase hex 32-byte WireGuard key to its Base64 form.
+/// Round-trip a [`wireguard_nt::WireguardPeer`] (from `get_config`) back into
+/// a [`wireguard_nt::SetPeer`] so the full peer list can be rebuilt for
+/// `set_config` when adding or removing a single peer.
 #[cfg(windows)]
-fn hex_to_b64(h: &str) -> Result<String> {
-    use base64::Engine as _;
-    let bytes = hex::decode(h).context("hex decode key")?;
-    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+fn wg_peer_to_set_peer(peer: &wireguard_nt::WireguardPeer) -> wireguard_nt::SetPeer {
+    wireguard_nt::SetPeer {
+        public_key: Some(peer.public_key),
+        preshared_key: if peer.preshared_key == [0u8; 32] {
+            None
+        } else {
+            Some(peer.preshared_key)
+        },
+        keep_alive: if peer.persistent_keepalive == 0 {
+            None
+        } else {
+            Some(peer.persistent_keepalive)
+        },
+        endpoint: peer.endpoint,
+        allowed_ips: peer.allowed_ips.clone(),
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

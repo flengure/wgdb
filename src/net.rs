@@ -610,56 +610,33 @@ mod macos_ioctl {
 // Windows implementation — Win32 IP Helper API
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Locate an existing WireGuard interface by name and return its adapter index.
+/// Create a WireGuard adapter via wireguard-nt and return its interface index.
 ///
-/// On Windows the WireGuard Windows service (or `wireguard.exe`) owns the
-/// Wintun adapter lifecycle.  wgdb does not create adapters; the interface is
-/// expected to already be managed by the service before this is called.
+/// Idempotent — if an adapter with this name already exists (e.g. from a
+/// previous daemon run) it is reopened rather than recreated, preserving any
+/// active tunnels.
 #[cfg(windows)]
 pub async fn create_link(_handle: &Handle, name: &str) -> Result<u32> {
-    link_index(_handle, name)
-        .await?
-        .with_context(|| format!("WireGuard interface '{name}' not found — ensure the WireGuard Windows service has created it"))
+    let name_owned = name.to_string();
+    let luid = tokio::task::spawn_blocking(move || crate::wg::create_adapter(&name_owned))
+        .await
+        .context("create_adapter spawn")??;
+    luid_to_index(luid).await
 }
 
-/// Stop the WireGuard Windows service for this tunnel interface.
+/// Delete a WireGuard adapter by dropping its wireguard-nt handle.
 ///
-/// This causes the Wintun adapter to be torn down and routes to be removed.
+/// The kernel interface is torn down when the last handle is closed.
 #[cfg(windows)]
 pub async fn delete_link(_handle: &Handle, name: &str) -> Result<()> {
-    use windows::Win32::System::Services::{
-        CloseServiceHandle, ControlService, OpenSCManagerW, OpenServiceW,
-        SERVICE_CONTROL_STOP, SERVICE_STATUS, SC_MANAGER_CONNECT, SERVICE_STOP,
-    };
-    use windows::core::PCWSTR;
-
-    let svc_name: Vec<u16> = format!("WireGuardTunnel${name}")
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-
-    unsafe {
-        let scm = OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT)
-            .context("OpenSCManager")?;
-        let svc = OpenServiceW(scm, PCWSTR(svc_name.as_ptr()), SERVICE_STOP);
-        match svc {
-            Ok(svc) => {
-                let mut status = SERVICE_STATUS::default();
-                let _ = ControlService(svc, SERVICE_CONTROL_STOP, &mut status);
-                let _ = CloseServiceHandle(svc);
-                tracing::info!("net: stopped WireGuard service for {name}");
-            }
-            Err(e) => {
-                // Service not found is not an error (already stopped / never started)
-                tracing::warn!("net: could not open WireGuard service for {name}: {e}");
-            }
-        }
-        let _ = CloseServiceHandle(scm);
-    }
+    let name_owned = name.to_string();
+    tokio::task::spawn_blocking(move || crate::wg::delete_adapter(&name_owned))
+        .await
+        .context("delete_adapter spawn")??;
     Ok(())
 }
 
-/// Bring the interface up — no-op on Windows; the WireGuard service does this.
+/// No-op on Windows — `create_link` already calls `adapter.up()`.
 #[cfg(windows)]
 pub async fn link_up(_handle: &Handle, _index: u32) -> Result<()> {
     Ok(())
@@ -778,6 +755,23 @@ pub async fn flush_addresses(_handle: &Handle, index: u32) -> Result<()> {
         FreeMibTable(table.cast());
     }
     Ok(())
+}
+
+/// Convert a raw LUID value returned by wireguard-nt into a Win32 interface
+/// index suitable for use with `set_mtu`, `add_address`, etc.
+#[cfg(windows)]
+async fn luid_to_index(luid_val: u64) -> Result<u32> {
+    use windows::Win32::NetworkManagement::IpHelper::ConvertInterfaceLuidToIndex;
+    use windows::Win32::NetworkManagement::Ndis::NET_LUID_LH;
+
+    unsafe {
+        let luid = NET_LUID_LH { Value: luid_val };
+        let mut idx = 0u32;
+        ConvertInterfaceLuidToIndex(&luid, &mut idx)
+            .ok()
+            .context("ConvertInterfaceLuidToIndex")?;
+        Ok(idx)
+    }
 }
 
 /// Return the interface index for `name` via `ConvertInterfaceAliasToLuid` +

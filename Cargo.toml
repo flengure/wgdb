@@ -45,16 +45,17 @@ wireguard-control = "1.7.1"
 libc = "0.2"
 nix  = { version = "0.29", features = ["net"] }
 
-# ── Windows-only: WG UAPI over named pipe + Win32 IP Helper ──────────────────
+# ── Windows-only: wireguard-nt kernel driver + Win32 IP Helper ───────────────
 
 [target.'cfg(windows)'.dependencies]
+wireguard-nt = "0.5"
+ipnet        = "2"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
     "Win32_System_IO",
-    "Win32_System_Services",
 ] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 base64       = "0.22"
