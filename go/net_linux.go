@@ -36,3 +36,19 @@ func setMTU(ifName string, mtu int) error {
 	}
 	return nil
 }
+
+func addRoute(ifName, cidr string) error {
+	out, err := exec.Command("ip", "route", "add", cidr, "dev", ifName).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("ip route add %s dev %s: %s: %w", cidr, ifName, out, err)
+	}
+	return nil
+}
+
+func removeRoute(ifName, cidr string) error {
+	out, err := exec.Command("ip", "route", "del", cidr, "dev", ifName).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("ip route del %s dev %s: %s: %w", cidr, ifName, out, err)
+	}
+	return nil
+}

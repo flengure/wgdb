@@ -19,3 +19,11 @@ func linkUp(ifName string) error {
 func setMTU(ifName string, mtu int) error {
 	return fmt.Errorf("setMTU not implemented on this platform")
 }
+
+func addRoute(ifName, cidr string) error {
+	return fmt.Errorf("addRoute not implemented on this platform")
+}
+
+func removeRoute(ifName, cidr string) error {
+	return fmt.Errorf("removeRoute not implemented on this platform")
+}

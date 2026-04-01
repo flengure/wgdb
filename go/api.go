@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"reflect"
@@ -113,6 +114,18 @@ func setupRouter(state *AppState) http.Handler {
 		Method:      http.MethodDelete,
 		Path:        "/v1/interfaces/{name}",
 	}, state.deleteInterface)
+
+	huma.Register(adminAPI, huma.Operation{
+		OperationID: "import-interface",
+		Method:      http.MethodPost,
+		Path:        "/v1/interfaces/import",
+	}, state.importInterface)
+
+	huma.Register(adminAPI, huma.Operation{
+		OperationID: "export-interface",
+		Method:      http.MethodGet,
+		Path:        "/v1/interfaces/{name}/export",
+	}, state.exportInterface)
 
 	// Peers
 	huma.Register(adminAPI, huma.Operation{
@@ -241,6 +254,10 @@ type CreateInterfaceInput struct {
 		AllowedIPs *string `json:"allowed_ips,omitempty"`
 		PrivateKey *string `json:"private_key,omitempty"`
 		Enabled    *bool   `json:"enabled,omitempty"`
+		PreUp      *string `json:"pre_up,omitempty"`
+		PostUp     *string `json:"post_up,omitempty"`
+		PreDown    *string `json:"pre_down,omitempty"`
+		PostDown   *string `json:"post_down,omitempty"`
 	}
 }
 
@@ -282,6 +299,7 @@ func (s *AppState) createInterface(_ context.Context, input *CreateInterfaceInpu
 		ListenPort: listenPort, AddressV4: body.AddressV4, AddressV6: body.AddressV6,
 		Mtu: body.Mtu, Dns: body.Dns, Endpoint: body.Endpoint,
 		AllowedIPs: body.AllowedIPs, Enabled: enabled,
+		PreUp: body.PreUp, PostUp: body.PostUp, PreDown: body.PreDown, PostDown: body.PostDown,
 	}
 	created, err := dbInsertInterface(s.db, iface)
 	if err != nil {
@@ -345,6 +363,10 @@ type UpdateInterfaceInput struct {
 		Endpoint   OmittableNullable[string] `json:"endpoint,omitempty"`
 		AllowedIPs OmittableNullable[string] `json:"allowed_ips,omitempty"`
 		Enabled    OmittableNullable[bool]   `json:"enabled,omitempty"`
+		PreUp      OmittableNullable[string] `json:"pre_up,omitempty"`
+		PostUp     OmittableNullable[string] `json:"post_up,omitempty"`
+		PreDown    OmittableNullable[string] `json:"pre_down,omitempty"`
+		PostDown   OmittableNullable[string] `json:"post_down,omitempty"`
 	}
 }
 
@@ -423,6 +445,38 @@ func (s *AppState) updateInterface(_ context.Context, input *UpdateInterfaceInpu
 		v, _ := body.Enabled.Get()
 		iface.Enabled = v
 	}
+	if !body.PreUp.IsOmitted() {
+		if body.PreUp.IsNull() {
+			iface.PreUp = nil
+		} else {
+			v, _ := body.PreUp.Get()
+			iface.PreUp = &v
+		}
+	}
+	if !body.PostUp.IsOmitted() {
+		if body.PostUp.IsNull() {
+			iface.PostUp = nil
+		} else {
+			v, _ := body.PostUp.Get()
+			iface.PostUp = &v
+		}
+	}
+	if !body.PreDown.IsOmitted() {
+		if body.PreDown.IsNull() {
+			iface.PreDown = nil
+		} else {
+			v, _ := body.PreDown.Get()
+			iface.PreDown = &v
+		}
+	}
+	if !body.PostDown.IsOmitted() {
+		if body.PostDown.IsNull() {
+			iface.PostDown = nil
+		} else {
+			v, _ := body.PostDown.Get()
+			iface.PostDown = &v
+		}
+	}
 
 	if err := dbUpdateInterface(s.db, iface); err != nil {
 		return nil, huma.Error500InternalServerError(err.Error())
@@ -433,7 +487,7 @@ func (s *AppState) updateInterface(_ context.Context, input *UpdateInterfaceInpu
 			slog.Warn("bring up interface", "name", input.Name, "err", err)
 		}
 	} else if wasEnabled && !iface.Enabled {
-		if err := s.wg.DeleteLink(input.Name); err != nil {
+		if err := s.wg.DeleteLinkWithHooks(input.Name, iface); err != nil {
 			slog.Warn("delete link", "name", input.Name, "err", err)
 		}
 	} else if iface.Enabled {
@@ -464,7 +518,8 @@ type DeleteInterfaceOutput struct {
 }
 
 func (s *AppState) deleteInterface(_ context.Context, input *InterfaceNameParam) (*struct{}, error) {
-	s.wg.DeleteLink(input.Name)
+	iface, _ := dbGetInterface(s.db, input.Name)
+	s.wg.DeleteLinkWithHooks(input.Name, iface)
 	pubkeys, err := dbDeleteInterface(s.db, input.Name)
 	if err != nil {
 		return nil, huma.Error500InternalServerError(err.Error())
@@ -1006,6 +1061,155 @@ func (s *AppState) revokeToken(_ context.Context, input *TokenParam) (*struct{},
 		return nil, huma.Error404NotFound("token not found")
 	}
 	return nil, nil
+}
+
+// ── Import / Export handlers ──────────────────────────────────────────────────
+
+type ImportInterfaceInput struct {
+	RawBody []byte
+}
+
+func (s *AppState) importInterface(_ context.Context, input *ImportInterfaceInput) (*InterfaceOutput, error) {
+	conf, err := parseWGConf(string(input.RawBody))
+	if err != nil {
+		return nil, huma.Error400BadRequest("invalid wg config: " + err.Error())
+	}
+
+	if conf.Name == "" {
+		conf.Name = "wg0"
+	}
+	if !validIfName(conf.Name) {
+		return nil, huma.Error400BadRequest("invalid interface name in config")
+	}
+
+	var privB64, pubB64 string
+	if conf.PrivateKey != "" {
+		privB64, pubB64, err = ImportPrivateKey(conf.PrivateKey)
+		if err != nil {
+			return nil, huma.Error400BadRequest("invalid PrivateKey")
+		}
+	} else {
+		privB64, pubB64, err = GenerateKeypair()
+		if err != nil {
+			return nil, huma.Error500InternalServerError(err.Error())
+		}
+	}
+
+	port := int64(51820)
+	if conf.ListenPort > 0 {
+		port = int64(conf.ListenPort)
+	}
+
+	iface := &Interface{
+		Name: conf.Name, PrivateKey: privB64, Pubkey: pubB64,
+		ListenPort: port, Enabled: true,
+	}
+	if conf.AddressV4 != "" {
+		iface.AddressV4 = &conf.AddressV4
+	}
+	if conf.AddressV6 != "" {
+		iface.AddressV6 = &conf.AddressV6
+	}
+	if conf.DNS != "" {
+		iface.Dns = &conf.DNS
+	}
+	if conf.MTU > 0 {
+		m := int64(conf.MTU)
+		iface.Mtu = &m
+	}
+	if conf.PreUp != "" {
+		iface.PreUp = &conf.PreUp
+	}
+	if conf.PostUp != "" {
+		iface.PostUp = &conf.PostUp
+	}
+	if conf.PreDown != "" {
+		iface.PreDown = &conf.PreDown
+	}
+	if conf.PostDown != "" {
+		iface.PostDown = &conf.PostDown
+	}
+
+	created, err := dbInsertInterface(s.db, iface)
+	if err != nil {
+		if strings.Contains(err.Error(), "UNIQUE") {
+			return nil, huma.Error409Conflict("interface name already exists")
+		}
+		return nil, huma.Error500InternalServerError(err.Error())
+	}
+
+	// Insert peers from [Peer] sections using a synthetic principal per pubkey.
+	for _, cp := range conf.Peers {
+		principalID, err := dbUpsertPrincipal(s.db, nil, "imported:"+cp.PublicKey, nil)
+		if err != nil {
+			slog.Warn("import peer principal", "pubkey", cp.PublicKey[:min(8, len(cp.PublicKey))], "err", err)
+			continue
+		}
+		peer := &Peer{
+			PrincipalID: principalID, IfaceID: created.ID,
+			Pubkey: cp.PublicKey,
+		}
+		if cp.PresharedKey != "" {
+			peer.Psk = &cp.PresharedKey
+		}
+		if cp.AllowedIPs != "" {
+			// Store first IPv4 and IPv6 from AllowedIPs list.
+			for _, cidr := range strings.Split(cp.AllowedIPs, ",") {
+				cidr = strings.TrimSpace(cidr)
+				if strings.Contains(cidr, ":") {
+					if peer.Ipv6 == nil {
+						peer.Ipv6 = &cidr
+					}
+				} else {
+					if peer.Ipv4 == nil {
+						peer.Ipv4 = &cidr
+					}
+				}
+			}
+		}
+		if _, err := dbInsertPeer(s.db, peer); err != nil {
+			slog.Warn("import peer insert", "pubkey", cp.PublicKey[:min(8, len(cp.PublicKey))], "err", err)
+		}
+	}
+
+	if err := s.wg.BringUpInterface(s.db, created); err != nil {
+		slog.Warn("bring up imported interface", "name", created.Name, "err", err)
+	}
+
+	slog.Info("imported interface", "name", created.Name)
+	return &InterfaceOutput{Body: created}, nil
+}
+
+type ExportInterfaceInput struct {
+	Name string `path:"name"`
+}
+
+type ExportInterfaceOutput struct {
+	Body   string
+	Status int
+}
+
+func (s *AppState) exportInterface(_ context.Context, input *ExportInterfaceInput) (*huma.StreamResponse, error) {
+	iface, err := dbGetInterface(s.db, input.Name)
+	if err != nil {
+		return nil, huma.Error500InternalServerError(err.Error())
+	}
+	if iface == nil {
+		return nil, huma.Error404NotFound("interface not found")
+	}
+	peers, err := dbListPeersForIface(s.db, iface.ID)
+	if err != nil {
+		return nil, huma.Error500InternalServerError(err.Error())
+	}
+
+	text := generateWGConf(iface, peers)
+	return &huma.StreamResponse{
+		Body: func(ctx huma.Context) {
+			ctx.SetHeader("Content-Type", "text/plain; charset=utf-8")
+			ctx.SetStatus(http.StatusOK)
+			io.WriteString(ctx.BodyWriter(), text)
+		},
+	}, nil
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

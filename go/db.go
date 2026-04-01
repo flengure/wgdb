@@ -25,6 +25,10 @@ type Interface struct {
 	Endpoint   *string `json:"endpoint"    db:"endpoint"`
 	AllowedIPs *string `json:"allowed_ips" db:"allowed_ips"`
 	Enabled    bool    `json:"enabled"     db:"enabled"`
+	PreUp      *string `json:"pre_up"      db:"pre_up"`
+	PostUp     *string `json:"post_up"     db:"post_up"`
+	PreDown    *string `json:"pre_down"    db:"pre_down"`
+	PostDown   *string `json:"post_down"   db:"post_down"`
 	Updated    int64   `json:"updated"     db:"updated"`
 }
 
@@ -177,6 +181,16 @@ func migrate(db *sqlx.DB) error {
 		}
 		db.Exec(`UPDATE schema_version SET version=3`)
 	}
+	if version < 4 {
+		for _, col := range []string{"pre_up", "post_up", "pre_down", "post_down"} {
+			var cnt int
+			db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('interfaces') WHERE name=?`, col).Scan(&cnt)
+			if cnt == 0 {
+				db.Exec(`ALTER TABLE interfaces ADD COLUMN ` + col + ` TEXT`)
+			}
+		}
+		db.Exec(`UPDATE schema_version SET version=4`)
+	}
 	return nil
 }
 
@@ -184,13 +198,13 @@ func migrate(db *sqlx.DB) error {
 
 func dbListInterfaces(db *sqlx.DB) ([]Interface, error) {
 	rows := []Interface{}
-	err := db.Select(&rows, `SELECT id,name,private_key,pubkey,listen_port,address_v4,address_v6,mtu,dns,endpoint,allowed_ips,enabled,updated FROM interfaces ORDER BY name`)
+	err := db.Select(&rows, `SELECT id,name,private_key,pubkey,listen_port,address_v4,address_v6,mtu,dns,endpoint,allowed_ips,enabled,pre_up,post_up,pre_down,post_down,updated FROM interfaces ORDER BY name`)
 	return rows, err
 }
 
 func dbGetInterface(db *sqlx.DB, name string) (*Interface, error) {
 	var row Interface
-	err := db.Get(&row, `SELECT id,name,private_key,pubkey,listen_port,address_v4,address_v6,mtu,dns,endpoint,allowed_ips,enabled,updated FROM interfaces WHERE name=?`, name)
+	err := db.Get(&row, `SELECT id,name,private_key,pubkey,listen_port,address_v4,address_v6,mtu,dns,endpoint,allowed_ips,enabled,pre_up,post_up,pre_down,post_down,updated FROM interfaces WHERE name=?`, name)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -199,7 +213,7 @@ func dbGetInterface(db *sqlx.DB, name string) (*Interface, error) {
 
 func dbGetInterfaceByID(db *sqlx.DB, id int64) (*Interface, error) {
 	var row Interface
-	err := db.Get(&row, `SELECT id,name,private_key,pubkey,listen_port,address_v4,address_v6,mtu,dns,endpoint,allowed_ips,enabled,updated FROM interfaces WHERE id=?`, id)
+	err := db.Get(&row, `SELECT id,name,private_key,pubkey,listen_port,address_v4,address_v6,mtu,dns,endpoint,allowed_ips,enabled,pre_up,post_up,pre_down,post_down,updated FROM interfaces WHERE id=?`, id)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -208,10 +222,11 @@ func dbGetInterfaceByID(db *sqlx.DB, id int64) (*Interface, error) {
 
 func dbInsertInterface(db *sqlx.DB, iface *Interface) (*Interface, error) {
 	res, err := db.Exec(
-		`INSERT INTO interfaces (name,private_key,pubkey,listen_port,address_v4,address_v6,mtu,dns,endpoint,allowed_ips,enabled) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+		`INSERT INTO interfaces (name,private_key,pubkey,listen_port,address_v4,address_v6,mtu,dns,endpoint,allowed_ips,enabled,pre_up,post_up,pre_down,post_down) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		iface.Name, iface.PrivateKey, iface.Pubkey, iface.ListenPort,
 		iface.AddressV4, iface.AddressV6, iface.Mtu, iface.Dns,
 		iface.Endpoint, iface.AllowedIPs, iface.Enabled,
+		iface.PreUp, iface.PostUp, iface.PreDown, iface.PostDown,
 	)
 	if err != nil {
 		return nil, err
@@ -222,10 +237,11 @@ func dbInsertInterface(db *sqlx.DB, iface *Interface) (*Interface, error) {
 
 func dbUpdateInterface(db *sqlx.DB, iface *Interface) error {
 	_, err := db.Exec(
-		`UPDATE interfaces SET private_key=?,pubkey=?,listen_port=?,address_v4=?,address_v6=?,mtu=?,dns=?,endpoint=?,allowed_ips=?,enabled=?,updated=unixepoch() WHERE id=?`,
+		`UPDATE interfaces SET private_key=?,pubkey=?,listen_port=?,address_v4=?,address_v6=?,mtu=?,dns=?,endpoint=?,allowed_ips=?,enabled=?,pre_up=?,post_up=?,pre_down=?,post_down=?,updated=unixepoch() WHERE id=?`,
 		iface.PrivateKey, iface.Pubkey, iface.ListenPort,
 		iface.AddressV4, iface.AddressV6, iface.Mtu, iface.Dns,
-		iface.Endpoint, iface.AllowedIPs, iface.Enabled, iface.ID,
+		iface.Endpoint, iface.AllowedIPs, iface.Enabled,
+		iface.PreUp, iface.PostUp, iface.PreDown, iface.PostDown, iface.ID,
 	)
 	return err
 }

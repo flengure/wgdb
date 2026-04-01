@@ -65,3 +65,37 @@ func setMTU(ifName string, mtu int) error {
 	}
 	return nil
 }
+
+func addRoute(ifName, cidr string) error {
+	ip, _, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return fmt.Errorf("parse CIDR %s: %w", cidr, err)
+	}
+	var out []byte
+	if ip.To4() != nil {
+		out, err = exec.Command("route", "add", "-net", cidr, "-interface", ifName).CombinedOutput()
+	} else {
+		out, err = exec.Command("route", "add", "-inet6", cidr, "-interface", ifName).CombinedOutput()
+	}
+	if err != nil {
+		return fmt.Errorf("route add %s via %s: %s: %w", cidr, ifName, out, err)
+	}
+	return nil
+}
+
+func removeRoute(ifName, cidr string) error {
+	ip, _, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return fmt.Errorf("parse CIDR %s: %w", cidr, err)
+	}
+	var out []byte
+	if ip.To4() != nil {
+		out, err = exec.Command("route", "delete", "-net", cidr, "-interface", ifName).CombinedOutput()
+	} else {
+		out, err = exec.Command("route", "delete", "-inet6", cidr, "-interface", ifName).CombinedOutput()
+	}
+	if err != nil {
+		return fmt.Errorf("route delete %s via %s: %s: %w", cidr, ifName, out, err)
+	}
+	return nil
+}

@@ -6,7 +6,9 @@ package main
 
 import (
 	"fmt"
+	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -112,11 +114,25 @@ func (m *WGManager) AddPeer(logicalName string, peer *Peer) error {
 	if err != nil {
 		return err
 	}
-	return c.ConfigureDevice(logicalName, wgtypes.Config{Peers: []wgtypes.PeerConfig{pc}})
+	if err := c.ConfigureDevice(logicalName, wgtypes.Config{Peers: []wgtypes.PeerConfig{pc}}); err != nil {
+		return err
+	}
+	realName := m.realInterfaceName(logicalName)
+	for _, cidr := range peerAllowedIPs(peer) {
+		if err := addRoute(realName, cidr); err != nil {
+			slog.Warn("add route", "iface", logicalName, "cidr", cidr, "err", err)
+		}
+	}
+	return nil
 }
 
 // RemovePeer removes a peer from a live interface by its base64 public key.
+// Pass peer to also remove its routes; peer may be nil.
 func (m *WGManager) RemovePeer(logicalName, pubkey string) error {
+	return m.RemovePeerWithRoutes(logicalName, pubkey, nil)
+}
+
+func (m *WGManager) RemovePeerWithRoutes(logicalName, pubkey string, peer *Peer) error {
 	c, err := wgctrl.New()
 	if err != nil {
 		return fmt.Errorf("wgctrl.New: %w", err)
@@ -127,9 +143,20 @@ func (m *WGManager) RemovePeer(logicalName, pubkey string) error {
 	if err != nil {
 		return fmt.Errorf("parse pubkey: %w", err)
 	}
-	return c.ConfigureDevice(logicalName, wgtypes.Config{
+	if err := c.ConfigureDevice(logicalName, wgtypes.Config{
 		Peers: []wgtypes.PeerConfig{{PublicKey: pk, Remove: true}},
-	})
+	}); err != nil {
+		return err
+	}
+	if peer != nil {
+		realName := m.realInterfaceName(logicalName)
+		for _, cidr := range peerAllowedIPs(peer) {
+			if err := removeRoute(realName, cidr); err != nil {
+				slog.Warn("remove route", "iface", logicalName, "cidr", cidr, "err", err)
+			}
+		}
+	}
+	return nil
 }
 
 // Handshakes returns a map of base64_pubkey → last-handshake unix timestamp.
@@ -174,8 +201,8 @@ func (m *WGManager) Stats(logicalName string) (*InterfaceStats, error) {
 }
 
 // BringUpInterface orchestrates the full startup sequence for a WireGuard
-// interface: create link → configure WG → assign addresses → bring up.
-// Delegates interface creation to the platform implementation.
+// interface: pre_up hooks → create link → configure WG → assign addresses →
+// bring up → add routes → post_up hooks.
 func (m *WGManager) BringUpInterface(db *sqlx.DB, iface *Interface) error {
 	peers, err := dbListPeersForIface(db, iface.ID)
 	if err != nil {
@@ -185,6 +212,9 @@ func (m *WGManager) BringUpInterface(db *sqlx.DB, iface *Interface) error {
 	if iface.Mtu != nil {
 		mtu = int(*iface.Mtu)
 	}
+
+	runHooks(derefStrWG(iface.PreUp), iface.Name)
+
 	if err := m.createLink(iface.Name, mtu); err != nil {
 		return fmt.Errorf("create link %s: %w", iface.Name, err)
 	}
@@ -205,12 +235,36 @@ func (m *WGManager) BringUpInterface(db *sqlx.DB, iface *Interface) error {
 	if err := linkUp(realName); err != nil {
 		return fmt.Errorf("link up %s: %w", realName, err)
 	}
+	for i := range peers {
+		for _, cidr := range peerAllowedIPs(&peers[i]) {
+			if err := addRoute(realName, cidr); err != nil {
+				slog.Warn("add route", "iface", iface.Name, "cidr", cidr, "err", err)
+			}
+		}
+	}
+
+	runHooks(derefStrWG(iface.PostUp), iface.Name)
 	return nil
 }
 
-// DeleteLink tears down a live WireGuard interface.
+// DeleteLink tears down a live WireGuard interface with pre/post down hooks.
 func (m *WGManager) DeleteLink(name string) error {
-	return m.deleteLink(name)
+	return m.DeleteLinkWithHooks(name, nil)
+}
+
+// DeleteLinkWithHooks tears down a live WireGuard interface, running hooks and
+// removing peer routes if iface is provided.
+func (m *WGManager) DeleteLinkWithHooks(name string, iface *Interface) error {
+	if iface != nil {
+		runHooks(derefStrWG(iface.PreDown), name)
+	}
+	if err := m.deleteLink(name); err != nil {
+		return err
+	}
+	if iface != nil {
+		runHooks(derefStrWG(iface.PostDown), name)
+	}
+	return nil
 }
 
 // FlushAndReaddresses removes all addresses from an interface and re-adds them.
@@ -238,6 +292,25 @@ func (m *WGManager) SetMTU(name string, mtu int) error {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+// peerAllowedIPs returns the list of CIDR strings for a peer's allocated IPs.
+func peerAllowedIPs(peer *Peer) []string {
+	var out []string
+	if peer.Ipv4 != nil && *peer.Ipv4 != "" {
+		out = append(out, *peer.Ipv4)
+	}
+	if peer.Ipv6 != nil && *peer.Ipv6 != "" {
+		out = append(out, *peer.Ipv6)
+	}
+	return out
+}
+
+func derefStrWG(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return strings.TrimSpace(*s)
+}
 
 func buildPeerConfig(peer *Peer) (wgtypes.PeerConfig, error) {
 	pk, err := wgtypes.ParseKey(peer.Pubkey)
