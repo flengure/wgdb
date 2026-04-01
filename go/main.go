@@ -32,6 +32,12 @@ func main() {
 		*adminToken = t
 	}
 
+	checkPrivileges()
+
+	if err := initWintun(); err != nil {
+		fatalf("init wintun: %v", err)
+	}
+
 	slog.Info("wgdb starting", "db", *dbPath, "addr", *addr)
 
 	// Ensure parent directory exists.
@@ -61,7 +67,7 @@ func main() {
 		ifaceNames = append(ifaceNames, iface.Name)
 		if iface.Enabled {
 			if err := wg.BringUpInterface(db, &iface); err != nil {
-				slog.Warn("bring up interface on startup", "name", iface.Name, "err", err)
+				slog.Error("failed to bring up interface on startup", "name", iface.Name, "err", err)
 			}
 		}
 	}
