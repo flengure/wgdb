@@ -55,17 +55,21 @@ impl Default for Handle {
     }
 }
 
-/// Windows: stateless — all Win32 calls open and close handles internally.
+/// Windows: tracks wireguard-go child processes so they can be killed on
+/// [`delete_link`].  Cheap to clone (reference-counted).
 #[cfg(windows)]
 #[derive(Clone)]
-pub struct Handle;
+pub struct Handle(
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, std::process::Child>>>,
+);
 
 #[cfg(windows)]
 impl Handle {
-    /// Create a new handle (no-op on Windows).
     #[must_use]
     pub fn new() -> Self {
-        Handle
+        Handle(std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )))
     }
 }
 
@@ -610,33 +614,48 @@ mod macos_ioctl {
 // Windows implementation — Win32 IP Helper API
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Create a WireGuard adapter via wintun and return its interface index.
+/// Spawn `wireguard-go.exe <name>`, wait up to 5 s for the interface to appear,
+/// then return its interface index.
 ///
-/// Idempotent — if an adapter with this name already exists (e.g. from a
-/// previous daemon run) it is reopened rather than recreated, preserving any
-/// active tunnels.
+/// `wireguard-go.exe` (and its bundled `wintun.dll`) must be on `PATH`.
+/// Idempotent — if the interface already exists the existing index is returned.
 #[cfg(windows)]
-pub async fn create_link(_handle: &Handle, name: &str) -> Result<u32> {
-    let name_owned = name.to_string();
-    let luid = tokio::task::spawn_blocking(move || crate::wg::create_adapter(&name_owned))
-        .await
-        .context("create_adapter spawn")??;
-    luid_to_index(luid).await
+pub async fn create_link(handle: &Handle, name: &str) -> Result<u32> {
+    if let Some(idx) = link_index(handle, name).await? {
+        tracing::debug!("net: {name} already exists (idx {idx})");
+        return Ok(idx);
+    }
+
+    let child = std::process::Command::new("wireguard-go")
+        .arg(name)
+        .spawn()
+        .context("spawn wireguard-go.exe — install wireguard-go and add to PATH")?;
+
+    let pid = child.id();
+    handle.0.lock().unwrap().insert(name.to_string(), child);
+    tracing::info!("net: spawned wireguard-go for {name} (pid {pid})");
+
+    for _ in 0..50u8 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if let Some(idx) = link_index(handle, name).await? {
+            tracing::info!("net: {name} up (idx {idx})");
+            return Ok(idx);
+        }
+    }
+    anyhow::bail!("wireguard-go did not create interface {name} within 5 s")
 }
 
-/// Delete a WireGuard adapter by dropping its wintun handle.
-///
-/// The kernel interface is torn down when the last handle is closed.
+/// Kill the `wireguard-go.exe` process associated with `name`.
 #[cfg(windows)]
-pub async fn delete_link(_handle: &Handle, name: &str) -> Result<()> {
-    let name_owned = name.to_string();
-    tokio::task::spawn_blocking(move || crate::wg::delete_adapter(&name_owned))
-        .await
-        .context("delete_adapter spawn")??;
+pub async fn delete_link(handle: &Handle, name: &str) -> Result<()> {
+    if let Some(mut child) = handle.0.lock().unwrap().remove(name) {
+        let _ = child.kill();
+        tracing::info!("net: deleted {name} (killed wireguard-go)");
+    }
     Ok(())
 }
 
-/// No-op on Windows — `create_link` already calls `adapter.up()`.
+/// No-op on Windows — wireguard-go brings the interface up itself.
 #[cfg(windows)]
 pub async fn link_up(_handle: &Handle, _index: u32) -> Result<()> {
     Ok(())
@@ -757,22 +776,6 @@ pub async fn flush_addresses(_handle: &Handle, index: u32) -> Result<()> {
     Ok(())
 }
 
-/// Convert a raw LUID value returned by wintun into a Win32 interface
-/// index suitable for use with `set_mtu`, `add_address`, etc.
-#[cfg(windows)]
-async fn luid_to_index(luid_val: u64) -> Result<u32> {
-    use windows::Win32::NetworkManagement::IpHelper::ConvertInterfaceLuidToIndex;
-    use windows::Win32::NetworkManagement::Ndis::NET_LUID_LH;
-
-    unsafe {
-        let luid = NET_LUID_LH { Value: luid_val };
-        let mut idx = 0u32;
-        ConvertInterfaceLuidToIndex(&luid, &mut idx)
-            .ok()
-            .context("ConvertInterfaceLuidToIndex")?;
-        Ok(idx)
-    }
-}
 
 /// Return the interface index for `name` via `ConvertInterfaceAliasToLuid` +
 /// `ConvertInterfaceLuidToIndex`, or `None` if the interface does not exist.

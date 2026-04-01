@@ -163,11 +163,6 @@ async fn main() -> Result<()> {
 
     // ── Platform-specific network handle setup ────────────────────────────────
 
-    // Windows: extract the embedded wintun.dll to a temp file and load it.
-    // Requires Administrator privileges (wintun creates a kernel TUN adapter).
-    #[cfg(windows)]
-    wg::load_library().context("load wintun")?;
-
     // On Linux we open an rtnetlink socket and spawn its event loop.
     // On other platforms we create a lightweight handle (macOS: PID map,
     // Windows: unit struct).
