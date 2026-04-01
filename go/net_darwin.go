@@ -17,8 +17,9 @@ func addAddress(ifName, cidr string) error {
 	}
 	_ = ipNet
 	if ip.To4() != nil {
-		// Point-to-point: same address for local and remote (utun style)
-		out, err := exec.Command("ifconfig", ifName, "inet", ip.String(), ip.String()).CombinedOutput()
+		mask := net.IP(ipNet.Mask)
+		netmask := fmt.Sprintf("%d.%d.%d.%d", mask[0], mask[1], mask[2], mask[3])
+		out, err := exec.Command("ifconfig", ifName, "inet", ip.String(), ip.String(), "netmask", netmask).CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("ifconfig %s inet %s: %s: %w", ifName, ip, out, err)
 		}
