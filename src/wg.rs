@@ -224,17 +224,31 @@ static ADAPTERS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, wireguard_nt::Adapter>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
-/// Load wireguard.dll from the WireGuard for Windows installation directory.
-/// Must be called once at startup (before any adapter operations) and requires
-/// Administrator privileges.
+/// Load wireguard.dll, searching in order:
+/// 1. Same directory as the running executable (bundled alongside wgdb.exe)
+/// 2. WireGuard for Windows default install path
+/// 3. Current working directory / PATH
+///
+/// Must be called once at startup before any adapter operations.
+/// Requires Administrator privileges.
 #[cfg(windows)]
 pub fn load_library() -> Result<()> {
     let wg = unsafe {
-        wireguard_nt::load_from_path(r"C:\Program Files\WireGuard\wireguard.dll")
-            .or_else(|_| wireguard_nt::load_from_path("wireguard.dll"))
-            .context("load wireguard.dll — ensure WireGuard for Windows is installed and wgdb is running as Administrator")?
+        // Prefer the DLL bundled next to the exe — works with the release zip.
+        let beside_exe = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("wireguard.dll")));
+
+        let result = beside_exe
+            .as_deref()
+            .map(wireguard_nt::load_from_path)
+            .unwrap_or(Err(anyhow::anyhow!("no exe path")))
+            .or_else(|_| wireguard_nt::load_from_path(r"C:\Program Files\WireGuard\wireguard.dll"))
+            .or_else(|_| wireguard_nt::load_from_path("wireguard.dll"));
+
+        result.context("wireguard.dll not found — place wireguard.dll in the same directory as wgdb.exe")?
     };
-    WIREGUARD.set(wg).ok(); // ignore "already initialised"
+    WIREGUARD.set(wg).ok();
     Ok(())
 }
 

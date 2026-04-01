@@ -44,11 +44,13 @@ jobs:
             target: x86_64-pc-windows-msvc
             artifact: wgdb.exe
             binary: wgdb-windows-x64.exe
+            wg_arch: amd64
 
           - os: windows-11-arm
             target: aarch64-pc-windows-msvc
             artifact: wgdb.exe
             binary: wgdb-windows-arm64.exe
+            wg_arch: arm64
 
     runs-on: ${{ matrix.os }}
 
@@ -90,9 +92,29 @@ jobs:
           mv target/${{ matrix.target }}/release/${{ matrix.artifact }} ${{ matrix.binary }}
           tar czf ${{ matrix.binary }}.tar.gz ${{ matrix.binary }}
 
-      - name: Rename artifact (Windows)
+      # Windows: download the matching wireguard.dll from the wireguard-nt
+      # project and bundle it with the exe so users get a self-contained zip.
+      # The prebuilt-binaries-license allows redistribution alongside other
+      # software — the license text is included in the archive.
+      - name: Bundle wireguard.dll (Windows)
         if: runner.os == 'Windows'
-        run: Move-Item target/${{ matrix.target }}/release/${{ matrix.artifact }} ${{ matrix.binary }}
+        shell: bash
+        run: |
+          curl -fsSL https://download.wireguard.com/wireguard-nt/wireguard-nt-0.10.1.zip \
+            -o wireguard-nt.zip
+          unzip -j wireguard-nt.zip \
+            "wireguard-nt-0.10.1/bin/${{ matrix.wg_arch }}/wireguard.dll" \
+            "wireguard-nt-0.10.1/prebuilt-binaries-license.txt" \
+            -d wgdist/
+          mv target/${{ matrix.target }}/release/${{ matrix.artifact }} wgdist/wgdb.exe
+          cd wgdist && zip ../${{ matrix.binary }}.zip wgdb.exe wireguard.dll prebuilt-binaries-license.txt
+
+      # Unix: tar.gz preserves the execute bit.
+      - name: Package artifact (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mv target/${{ matrix.target }}/release/${{ matrix.artifact }} ${{ matrix.binary }}
+          tar czf ${{ matrix.binary }}.tar.gz ${{ matrix.binary }}
 
       # Use the gh CLI (pre-installed on all GitHub runners, no Node.js
       # dependency) to create the release and upload assets.
@@ -108,7 +130,7 @@ jobs:
             --title "${{ github.ref_name }}" \
             2>/dev/null || true
           if [ "$RUNNER_OS" = "Windows" ]; then
-            gh release upload "${{ github.ref_name }}" ${{ matrix.binary }} --clobber
+            gh release upload "${{ github.ref_name }}" ${{ matrix.binary }}.zip --clobber
           else
             gh release upload "${{ github.ref_name }}" ${{ matrix.binary }}.tar.gz --clobber
           fi
