@@ -1,18 +1,51 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
-	"strconv"
+	"reflect"
 	"strings"
 
-	"github.com/gin-gonic/gin"
+	"github.com/danielgtaylor/huma/v2"
+	"github.com/danielgtaylor/huma/v2/adapters/humachi"
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
 	"github.com/jmoiron/sqlx"
 )
+
+// OmittableNullable distinguishes absent (not sent) vs null vs a value.
+type OmittableNullable[T any] struct {
+	Sent  bool
+	Null  bool
+	Value T
+}
+
+func (o *OmittableNullable[T]) UnmarshalJSON(b []byte) error {
+	if len(b) > 0 {
+		o.Sent = true
+		if string(b) == "null" {
+			o.Null = true
+			return nil
+		}
+		return json.Unmarshal(b, &o.Value)
+	}
+	return nil
+}
+
+func (o OmittableNullable[T]) Schema(r huma.Registry) *huma.Schema {
+	s := r.Schema(reflect.TypeOf(o.Value), true, "")
+	s.Nullable = true
+	return s
+}
+
+func (o OmittableNullable[T]) IsOmitted() bool { return !o.Sent }
+func (o OmittableNullable[T]) IsNull() bool     { return o.Sent && o.Null }
+func (o OmittableNullable[T]) Get() (T, bool)   { return o.Value, o.Sent && !o.Null }
 
 // ── App state ─────────────────────────────────────────────────────────────────
 
@@ -24,105 +57,201 @@ type AppState struct {
 
 // ── Router ────────────────────────────────────────────────────────────────────
 
-func setupRouter(state *AppState) *gin.Engine {
-	gin.SetMode(gin.ReleaseMode)
-	r := gin.New()
-	r.Use(gin.Recovery())
+func setupRouter(state *AppState) http.Handler {
+	r := chi.NewRouter()
+	r.Use(middleware.Recoverer)
+
+	api := humachi.New(r, huma.DefaultConfig("wgdb API", "1.0.0"))
 
 	// Public endpoints
-	r.POST("/v1/register", state.register)
-	r.POST("/v1/connect", state.connect)
+	huma.Register(api, huma.Operation{
+		OperationID: "register",
+		Method:      http.MethodPost,
+		Path:        "/v1/register",
+	}, state.register)
 
-	// Admin endpoints (bearer token required)
-	admin := r.Group("/v1", state.bearerAuth())
+	huma.Register(api, huma.Operation{
+		OperationID: "connect",
+		Method:      http.MethodPost,
+		Path:        "/v1/connect",
+	}, state.connect)
+
+	// Admin subrouter with bearer token middleware
+	ar := chi.NewRouter()
+	ar.Use(state.bearerAuth)
+	r.Mount("/", ar)
+
+	adminAPI := humachi.New(ar, huma.DefaultConfig("wgdb API", "1.0.0"))
 
 	// Interfaces
-	admin.GET("/interfaces", state.listInterfaces)
-	admin.POST("/interfaces", state.createInterface)
-	admin.GET("/interfaces/:name", state.getInterface)
-	admin.PATCH("/interfaces/:name", state.updateInterface)
-	admin.DELETE("/interfaces/:name", state.deleteInterface)
+	huma.Register(adminAPI, huma.Operation{
+		OperationID: "list-interfaces",
+		Method:      http.MethodGet,
+		Path:        "/v1/interfaces",
+	}, state.listInterfaces)
+
+	huma.Register(adminAPI, huma.Operation{
+		OperationID: "create-interface",
+		Method:      http.MethodPost,
+		Path:        "/v1/interfaces",
+	}, state.createInterface)
+
+	huma.Register(adminAPI, huma.Operation{
+		OperationID: "get-interface",
+		Method:      http.MethodGet,
+		Path:        "/v1/interfaces/{name}",
+	}, state.getInterface)
+
+	huma.Register(adminAPI, huma.Operation{
+		OperationID: "update-interface",
+		Method:      http.MethodPatch,
+		Path:        "/v1/interfaces/{name}",
+	}, state.updateInterface)
+
+	huma.Register(adminAPI, huma.Operation{
+		OperationID: "delete-interface",
+		Method:      http.MethodDelete,
+		Path:        "/v1/interfaces/{name}",
+	}, state.deleteInterface)
 
 	// Peers
-	admin.GET("/peers", state.listPeers)
-	admin.PATCH("/peers/:pubkey", state.updatePeer)
-	admin.DELETE("/peers/:pubkey", state.revokePeer)
+	huma.Register(adminAPI, huma.Operation{
+		OperationID: "list-peers",
+		Method:      http.MethodGet,
+		Path:        "/v1/peers",
+	}, state.listPeers)
+
+	huma.Register(adminAPI, huma.Operation{
+		OperationID: "update-peer",
+		Method:      http.MethodPatch,
+		Path:        "/v1/peers/{pubkey}",
+	}, state.updatePeer)
+
+	huma.Register(adminAPI, huma.Operation{
+		OperationID: "revoke-peer",
+		Method:      http.MethodDelete,
+		Path:        "/v1/peers/{pubkey}",
+	}, state.revokePeer)
 
 	// Principals
-	admin.GET("/principals", state.listPrincipals)
-	admin.POST("/principals", state.createPrincipal)
-	admin.GET("/principals/:id", state.getPrincipal)
-	admin.PATCH("/principals/:id", state.updatePrincipal)
-	admin.DELETE("/principals/:id", state.deletePrincipal)
-	admin.GET("/principals/:id/peers", state.listPrincipalPeers)
-	admin.POST("/principals/:id/session", state.createSession)
+	huma.Register(adminAPI, huma.Operation{
+		OperationID: "list-principals",
+		Method:      http.MethodGet,
+		Path:        "/v1/principals",
+	}, state.listPrincipals)
+
+	huma.Register(adminAPI, huma.Operation{
+		OperationID: "create-principal",
+		Method:      http.MethodPost,
+		Path:        "/v1/principals",
+	}, state.createPrincipal)
+
+	huma.Register(adminAPI, huma.Operation{
+		OperationID: "get-principal",
+		Method:      http.MethodGet,
+		Path:        "/v1/principals/{id}",
+	}, state.getPrincipal)
+
+	huma.Register(adminAPI, huma.Operation{
+		OperationID: "update-principal",
+		Method:      http.MethodPatch,
+		Path:        "/v1/principals/{id}",
+	}, state.updatePrincipal)
+
+	huma.Register(adminAPI, huma.Operation{
+		OperationID: "delete-principal",
+		Method:      http.MethodDelete,
+		Path:        "/v1/principals/{id}",
+	}, state.deletePrincipal)
+
+	huma.Register(adminAPI, huma.Operation{
+		OperationID: "list-principal-peers",
+		Method:      http.MethodGet,
+		Path:        "/v1/principals/{id}/peers",
+	}, state.listPrincipalPeers)
+
+	huma.Register(adminAPI, huma.Operation{
+		OperationID: "create-session",
+		Method:      http.MethodPost,
+		Path:        "/v1/principals/{id}/session",
+	}, state.createSession)
 
 	// Tokens
-	admin.GET("/tokens", state.listTokens)
-	admin.POST("/tokens", state.createToken)
-	admin.DELETE("/tokens/:token", state.revokeToken)
+	huma.Register(adminAPI, huma.Operation{
+		OperationID: "list-tokens",
+		Method:      http.MethodGet,
+		Path:        "/v1/tokens",
+	}, state.listTokens)
+
+	huma.Register(adminAPI, huma.Operation{
+		OperationID: "create-token",
+		Method:      http.MethodPost,
+		Path:        "/v1/tokens",
+	}, state.createToken)
+
+	huma.Register(adminAPI, huma.Operation{
+		OperationID: "revoke-token",
+		Method:      http.MethodDelete,
+		Path:        "/v1/tokens/{token}",
+	}, state.revokeToken)
 
 	return r
 }
 
 // ── Auth middleware ───────────────────────────────────────────────────────────
 
-func (s *AppState) bearerAuth() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		auth := c.GetHeader("Authorization")
+func (s *AppState) bearerAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
 		token, ok := strings.CutPrefix(auth, "Bearer ")
 		if !ok || token != s.adminToken {
-			c.AbortWithStatus(http.StatusUnauthorized)
+			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
-		c.Next()
-	}
-}
-
-// ── Error helpers ─────────────────────────────────────────────────────────────
-
-func apiErr(c *gin.Context, status int, msg string) {
-	c.JSON(status, gin.H{"error": msg})
-}
-
-func apiServerErr(c *gin.Context, err error) {
-	slog.Error("api error", "err", err)
-	c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		next.ServeHTTP(w, r)
+	})
 }
 
 // ── Interface handlers ────────────────────────────────────────────────────────
 
-func (s *AppState) listInterfaces(c *gin.Context) {
+type ListInterfacesOutput struct {
+	Body []Interface
+}
+
+func (s *AppState) listInterfaces(_ context.Context, _ *struct{}) (*ListInterfacesOutput, error) {
 	ifaces, err := dbListInterfaces(s.db)
 	if err != nil {
-		apiServerErr(c, err)
-		return
+		return nil, huma.Error500InternalServerError(err.Error())
 	}
-	c.JSON(http.StatusOK, ifaces)
+	if ifaces == nil {
+		ifaces = []Interface{}
+	}
+	return &ListInterfacesOutput{Body: ifaces}, nil
 }
 
-type CreateInterfaceBody struct {
-	Name       string  `json:"name"`
-	ListenPort *int64  `json:"listen_port"`
-	AddressV4  *string `json:"address_v4"`
-	AddressV6  *string `json:"address_v6"`
-	Mtu        *int64  `json:"mtu"`
-	Dns        *string `json:"dns"`
-	Endpoint   *string `json:"endpoint"`
-	AllowedIPs *string `json:"allowed_ips"`
-	PrivateKey *string `json:"private_key"`
-	Enabled    *bool   `json:"enabled"`
+type CreateInterfaceInput struct {
+	Body struct {
+		Name       string  `json:"name"`
+		ListenPort *int64  `json:"listen_port,omitempty"`
+		AddressV4  *string `json:"address_v4,omitempty"`
+		AddressV6  *string `json:"address_v6,omitempty"`
+		Mtu        *int64  `json:"mtu,omitempty"`
+		Dns        *string `json:"dns,omitempty"`
+		Endpoint   *string `json:"endpoint,omitempty"`
+		AllowedIPs *string `json:"allowed_ips,omitempty"`
+		PrivateKey *string `json:"private_key,omitempty"`
+		Enabled    *bool   `json:"enabled,omitempty"`
+	}
 }
 
-func (s *AppState) createInterface(c *gin.Context) {
-	var body CreateInterfaceBody
-	if err := c.ShouldBindJSON(&body); err != nil {
-		apiErr(c, http.StatusBadRequest, err.Error())
-		return
-	}
+type InterfaceOutput struct {
+	Body *Interface
+}
+
+func (s *AppState) createInterface(_ context.Context, input *CreateInterfaceInput) (*InterfaceOutput, error) {
+	body := input.Body
 	if body.Name == "" || !validIfName(body.Name) {
-		apiErr(c, http.StatusBadRequest, "name must be non-empty alphanumeric/hyphen/underscore")
-		return
+		return nil, huma.Error400BadRequest("name must be non-empty alphanumeric/hyphen/underscore")
 	}
 
 	listenPort := int64(51820)
@@ -139,14 +268,12 @@ func (s *AppState) createInterface(c *gin.Context) {
 	if body.PrivateKey != nil {
 		privB64, pubB64, err = ImportPrivateKey(*body.PrivateKey)
 		if err != nil {
-			apiErr(c, http.StatusBadRequest, "invalid private_key")
-			return
+			return nil, huma.Error400BadRequest("invalid private_key")
 		}
 	} else {
 		privB64, pubB64, err = GenerateKeypair()
 		if err != nil {
-			apiServerErr(c, err)
-			return
+			return nil, huma.Error500InternalServerError(err.Error())
 		}
 	}
 
@@ -159,11 +286,9 @@ func (s *AppState) createInterface(c *gin.Context) {
 	created, err := dbInsertInterface(s.db, iface)
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
-			apiErr(c, http.StatusConflict, "interface name already exists")
-			return
+			return nil, huma.Error409Conflict("interface name already exists")
 		}
-		apiServerErr(c, err)
-		return
+		return nil, huma.Error500InternalServerError(err.Error())
 	}
 
 	if enabled {
@@ -173,56 +298,63 @@ func (s *AppState) createInterface(c *gin.Context) {
 	}
 
 	slog.Info("created interface", "name", created.Name, "enabled", enabled)
-	c.JSON(http.StatusOK, created)
+	return &InterfaceOutput{Body: created}, nil
 }
 
-func (s *AppState) getInterface(c *gin.Context) {
-	name := c.Param("name")
-	iface, err := dbGetInterface(s.db, name)
-	if err != nil {
-		apiServerErr(c, err)
-		return
-	}
-	if iface == nil {
-		c.Status(http.StatusNotFound)
-		return
-	}
+type InterfaceNameParam struct {
+	Name string `path:"name"`
+}
 
-	// Augment with live stats if available
-	stats, _ := s.wg.Stats(name)
-
-	type response struct {
+type GetInterfaceOutput struct {
+	Body struct {
 		*Interface
 		PeerCount *int    `json:"peer_count,omitempty"`
 		RxBytes   *uint64 `json:"rx_bytes,omitempty"`
 		TxBytes   *uint64 `json:"tx_bytes,omitempty"`
 	}
-	resp := response{Interface: iface}
-	if stats != nil {
-		resp.PeerCount = &stats.PeerCount
-		resp.RxBytes = &stats.RxBytes
-		resp.TxBytes = &stats.TxBytes
-	}
-	c.JSON(http.StatusOK, resp)
 }
 
-func (s *AppState) updateInterface(c *gin.Context) {
-	name := c.Param("name")
-	iface, err := dbGetInterface(s.db, name)
+func (s *AppState) getInterface(_ context.Context, input *InterfaceNameParam) (*GetInterfaceOutput, error) {
+	iface, err := dbGetInterface(s.db, input.Name)
 	if err != nil {
-		apiServerErr(c, err)
-		return
+		return nil, huma.Error500InternalServerError(err.Error())
 	}
 	if iface == nil {
-		c.Status(http.StatusNotFound)
-		return
+		return nil, huma.Error404NotFound("interface not found")
 	}
 
-	// Use raw map to distinguish absent vs explicit null.
-	var raw map[string]json.RawMessage
-	if err := c.ShouldBindJSON(&raw); err != nil {
-		apiErr(c, http.StatusBadRequest, err.Error())
-		return
+	out := &GetInterfaceOutput{}
+	out.Body.Interface = iface
+	stats, _ := s.wg.Stats(input.Name)
+	if stats != nil {
+		out.Body.PeerCount = &stats.PeerCount
+		out.Body.RxBytes = &stats.RxBytes
+		out.Body.TxBytes = &stats.TxBytes
+	}
+	return out, nil
+}
+
+type UpdateInterfaceInput struct {
+	Name string `path:"name"`
+	Body struct {
+		ListenPort OmittableNullable[int64]  `json:"listen_port,omitempty"`
+		AddressV4  OmittableNullable[string] `json:"address_v4,omitempty"`
+		AddressV6  OmittableNullable[string] `json:"address_v6,omitempty"`
+		Mtu        OmittableNullable[int64]  `json:"mtu,omitempty"`
+		Dns        OmittableNullable[string] `json:"dns,omitempty"`
+		Endpoint   OmittableNullable[string] `json:"endpoint,omitempty"`
+		AllowedIPs OmittableNullable[string] `json:"allowed_ips,omitempty"`
+		Enabled    OmittableNullable[bool]   `json:"enabled,omitempty"`
+	}
+}
+
+func (s *AppState) updateInterface(_ context.Context, input *UpdateInterfaceInput) (*InterfaceOutput, error) {
+	iface, err := dbGetInterface(s.db, input.Name)
+	if err != nil {
+		return nil, huma.Error500InternalServerError(err.Error())
+	}
+	if iface == nil {
+		return nil, huma.Error404NotFound("interface not found")
 	}
 
 	wasEnabled := iface.Enabled
@@ -230,129 +362,158 @@ func (s *AppState) updateInterface(c *gin.Context) {
 	addrChanged := false
 	mtuChanged := false
 
-	if v, ok := raw["listen_port"]; ok {
-		var p int64
-		if err := json.Unmarshal(v, &p); err == nil {
-			portChanged = p != iface.ListenPort
-			iface.ListenPort = p
+	body := input.Body
+	if !body.ListenPort.IsNull() && !body.ListenPort.IsOmitted() {
+		v, _ := body.ListenPort.Get()
+		portChanged = v != iface.ListenPort
+		iface.ListenPort = v
+	}
+	if !body.AddressV4.IsOmitted() {
+		addrChanged = true
+		if body.AddressV4.IsNull() {
+			iface.AddressV4 = nil
+		} else {
+			v, _ := body.AddressV4.Get()
+			iface.AddressV4 = &v
 		}
 	}
-	if _, ok := raw["address_v4"]; ok {
+	if !body.AddressV6.IsOmitted() {
 		addrChanged = true
-		iface.AddressV4 = jsonNullableString(raw["address_v4"])
+		if body.AddressV6.IsNull() {
+			iface.AddressV6 = nil
+		} else {
+			v, _ := body.AddressV6.Get()
+			iface.AddressV6 = &v
+		}
 	}
-	if _, ok := raw["address_v6"]; ok {
-		addrChanged = true
-		iface.AddressV6 = jsonNullableString(raw["address_v6"])
-	}
-	if _, ok := raw["mtu"]; ok {
+	if !body.Mtu.IsOmitted() {
 		mtuChanged = true
-		iface.Mtu = jsonNullableInt64(raw["mtu"])
+		if body.Mtu.IsNull() {
+			iface.Mtu = nil
+		} else {
+			v, _ := body.Mtu.Get()
+			iface.Mtu = &v
+		}
 	}
-	if _, ok := raw["dns"]; ok {
-		iface.Dns = jsonNullableString(raw["dns"])
+	if !body.Dns.IsOmitted() {
+		if body.Dns.IsNull() {
+			iface.Dns = nil
+		} else {
+			v, _ := body.Dns.Get()
+			iface.Dns = &v
+		}
 	}
-	if _, ok := raw["endpoint"]; ok {
-		iface.Endpoint = jsonNullableString(raw["endpoint"])
+	if !body.Endpoint.IsOmitted() {
+		if body.Endpoint.IsNull() {
+			iface.Endpoint = nil
+		} else {
+			v, _ := body.Endpoint.Get()
+			iface.Endpoint = &v
+		}
 	}
-	if _, ok := raw["allowed_ips"]; ok {
-		iface.AllowedIPs = jsonNullableString(raw["allowed_ips"])
+	if !body.AllowedIPs.IsOmitted() {
+		if body.AllowedIPs.IsNull() {
+			iface.AllowedIPs = nil
+		} else {
+			v, _ := body.AllowedIPs.Get()
+			iface.AllowedIPs = &v
+		}
 	}
-	if v, ok := raw["enabled"]; ok {
-		var b bool
-		json.Unmarshal(v, &b)
-		iface.Enabled = b
+	if !body.Enabled.IsOmitted() && !body.Enabled.IsNull() {
+		v, _ := body.Enabled.Get()
+		iface.Enabled = v
 	}
 
 	if err := dbUpdateInterface(s.db, iface); err != nil {
-		apiServerErr(c, err)
-		return
+		return nil, huma.Error500InternalServerError(err.Error())
 	}
 
 	if !wasEnabled && iface.Enabled {
 		if err := s.wg.BringUpInterface(s.db, iface); err != nil {
-			slog.Warn("bring up interface", "name", name, "err", err)
+			slog.Warn("bring up interface", "name", input.Name, "err", err)
 		}
 	} else if wasEnabled && !iface.Enabled {
-		if err := s.wg.DeleteLink(name); err != nil {
-			slog.Warn("delete link", "name", name, "err", err)
+		if err := s.wg.DeleteLink(input.Name); err != nil {
+			slog.Warn("delete link", "name", input.Name, "err", err)
 		}
 	} else if iface.Enabled {
 		if portChanged {
 			peers, _ := dbListPeersForIface(s.db, iface.ID)
-			if err := s.wg.Configure(name, iface, peers); err != nil {
-				slog.Warn("configure interface", "name", name, "err", err)
+			if err := s.wg.Configure(input.Name, iface, peers); err != nil {
+				slog.Warn("configure interface", "name", input.Name, "err", err)
 			}
 		}
 		if addrChanged {
 			if err := s.wg.FlushAndReaddresses(iface); err != nil {
-				slog.Warn("flush/readd addresses", "name", name, "err", err)
+				slog.Warn("flush/readd addresses", "name", input.Name, "err", err)
 			}
 		}
 		if mtuChanged && iface.Mtu != nil {
-			if err := s.wg.SetMTU(name, int(*iface.Mtu)); err != nil {
-				slog.Warn("set mtu", "name", name, "err", err)
+			if err := s.wg.SetMTU(input.Name, int(*iface.Mtu)); err != nil {
+				slog.Warn("set mtu", "name", input.Name, "err", err)
 			}
 		}
 	}
 
-	slog.Info("updated interface", "name", name)
-	c.JSON(http.StatusOK, iface)
+	slog.Info("updated interface", "name", input.Name)
+	return &InterfaceOutput{Body: iface}, nil
 }
 
-func (s *AppState) deleteInterface(c *gin.Context) {
-	name := c.Param("name")
-	s.wg.DeleteLink(name) // best-effort; ignore error
-	pubkeys, err := dbDeleteInterface(s.db, name)
+type DeleteInterfaceOutput struct {
+	Status int
+}
+
+func (s *AppState) deleteInterface(_ context.Context, input *InterfaceNameParam) (*struct{}, error) {
+	s.wg.DeleteLink(input.Name)
+	pubkeys, err := dbDeleteInterface(s.db, input.Name)
 	if err != nil {
-		apiServerErr(c, err)
-		return
+		return nil, huma.Error500InternalServerError(err.Error())
 	}
 	if pubkeys == nil {
-		c.Status(http.StatusNotFound)
-		return
+		return nil, huma.Error404NotFound("interface not found")
 	}
-	slog.Info("deleted interface", "name", name, "peers_revoked", len(pubkeys))
-	c.Status(http.StatusNoContent)
+	slog.Info("deleted interface", "name", input.Name, "peers_revoked", len(pubkeys))
+	return nil, nil
 }
 
 // ── Session handler ───────────────────────────────────────────────────────────
 
-func (s *AppState) createSession(c *gin.Context) {
-	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
-	if err != nil {
-		apiErr(c, http.StatusBadRequest, "invalid id")
-		return
-	}
-	var body struct {
+type CreateSessionInput struct {
+	ID   int64 `path:"id"`
+	Body struct {
 		IfaceID int64 `json:"iface_id"`
 	}
-	if err := c.ShouldBindJSON(&body); err != nil {
-		apiErr(c, http.StatusBadRequest, err.Error())
-		return
+}
+
+type CreateSessionOutput struct {
+	Body struct {
+		Token   string `json:"token"`
+		Expires int64  `json:"expires"`
 	}
-	principal, err := dbGetPrincipal(s.db, id)
+}
+
+func (s *AppState) createSession(_ context.Context, input *CreateSessionInput) (*CreateSessionOutput, error) {
+	principal, err := dbGetPrincipal(s.db, input.ID)
 	if err != nil {
-		apiServerErr(c, err)
-		return
+		return nil, huma.Error500InternalServerError(err.Error())
 	}
 	if principal == nil {
-		c.Status(http.StatusNotFound)
-		return
+		return nil, huma.Error404NotFound("principal not found")
 	}
 	if principal.Status != "active" {
-		apiErr(c, http.StatusForbidden, "account suspended")
-		return
+		return nil, huma.Error403Forbidden("account suspended")
 	}
 
 	now := unixNow()
 	expires := now + 7200
 	token := randomToken()
-	if _, err := dbCreateToken(s.db, token, id, body.IfaceID, nil, &expires); err != nil {
-		apiServerErr(c, err)
-		return
+	if _, err := dbCreateToken(s.db, token, input.ID, input.Body.IfaceID, nil, &expires); err != nil {
+		return nil, huma.Error500InternalServerError(err.Error())
 	}
-	c.JSON(http.StatusOK, gin.H{"token": token, "expires": expires})
+	out := &CreateSessionOutput{}
+	out.Body.Token = token
+	out.Body.Expires = expires
+	return out, nil
 }
 
 // ── Connect handler ───────────────────────────────────────────────────────────
@@ -360,17 +521,17 @@ func (s *AppState) createSession(c *gin.Context) {
 type ConnectRequest struct {
 	Token      string  `json:"token"`
 	Pubkey     string  `json:"pubkey"`
-	Label      *string `json:"label"`
-	ClientIPv4 *string `json:"client_ipv4"`
-	ClientIPv6 *string `json:"client_ipv6"`
-	Psk        *string `json:"psk"`
+	Label      *string `json:"label,omitempty"`
+	ClientIPv4 *string `json:"client_ipv4,omitempty"`
+	ClientIPv6 *string `json:"client_ipv6,omitempty"`
+	Psk        *string `json:"psk,omitempty"`
 }
 
 type ConnectResponse struct {
 	ServerPubkey string   `json:"server_pubkey"`
 	Endpoint     string   `json:"endpoint"`
-	ClientIPv4   *string  `json:"client_ipv4"`
-	ClientIPv6   *string  `json:"client_ipv6"`
+	ClientIPv4   *string  `json:"client_ipv4,omitempty"`
+	ClientIPv6   *string  `json:"client_ipv6,omitempty"`
 	Psk          string   `json:"psk"`
 	AllowedIPs   string   `json:"allowed_ips"`
 	Dns          string   `json:"dns"`
@@ -378,53 +539,49 @@ type ConnectResponse struct {
 	Changes      []string `json:"changes"`
 }
 
-func (s *AppState) connect(c *gin.Context) {
-	var req ConnectRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		apiErr(c, http.StatusBadRequest, err.Error())
-		return
-	}
+type ConnectInput struct {
+	Body ConnectRequest
+}
+
+type ConnectOutput struct {
+	Body ConnectResponse
+}
+
+func (s *AppState) connect(_ context.Context, input *ConnectInput) (*ConnectOutput, error) {
+	req := input.Body
 
 	principalID, ifaceID, ok, err := dbConsumeToken(s.db, req.Token)
 	if err != nil {
-		apiServerErr(c, err)
-		return
+		return nil, huma.Error500InternalServerError(err.Error())
 	}
 	if !ok {
-		apiErr(c, http.StatusForbidden, "invalid or expired token")
-		return
+		return nil, huma.Error403Forbidden("invalid or expired token")
 	}
 
 	principal, err := dbGetPrincipal(s.db, principalID)
 	if err != nil || principal == nil {
-		c.Status(http.StatusNotFound)
-		return
+		return nil, huma.Error404NotFound("principal not found")
 	}
 	if principal.Status != "active" {
-		apiErr(c, http.StatusForbidden, "account suspended")
-		return
+		return nil, huma.Error403Forbidden("account suspended")
 	}
 
 	iface, err := dbGetInterfaceByID(s.db, ifaceID)
 	if err != nil || iface == nil {
-		c.Status(http.StatusNotFound)
-		return
+		return nil, huma.Error404NotFound("interface not found")
 	}
 
 	existing, existingPrincipalID, err := dbGetPeerOnIface(s.db, req.Pubkey, ifaceID)
 	if err != nil {
-		apiServerErr(c, err)
-		return
+		return nil, huma.Error500InternalServerError(err.Error())
 	}
 
 	if existing != nil {
 		if existingPrincipalID != principalID {
-			apiErr(c, http.StatusConflict, "public key already registered to another account")
-			return
+			return nil, huma.Error409Conflict("public key already registered to another account")
 		}
 		if existing.Status == "revoked" {
-			apiErr(c, http.StatusForbidden, "peer has been revoked")
-			return
+			return nil, huma.Error403Forbidden("peer has been revoked")
 		}
 
 		changes := []string{}
@@ -460,7 +617,7 @@ func (s *AppState) connect(c *gin.Context) {
 			outIPv6 = req.ClientIPv6
 		}
 
-		c.JSON(http.StatusOK, ConnectResponse{
+		return &ConnectOutput{Body: ConnectResponse{
 			ServerPubkey: iface.Pubkey,
 			Endpoint:     derefStr(iface.Endpoint),
 			ClientIPv4:   outIPv4,
@@ -470,11 +627,9 @@ func (s *AppState) connect(c *gin.Context) {
 			Dns:          derefStr(iface.Dns),
 			Status:       status,
 			Changes:      changes,
-		})
-		return
+		}}, nil
 	}
 
-	// New peer — allocate IPs, generate PSK, insert
 	var ipv4, ipv6 *string
 	if iface.AddressV4 != nil {
 		if addr, err := nextFreeIPv4(s.db, ifaceID, *iface.AddressV4); err == nil {
@@ -487,14 +642,12 @@ func (s *AppState) connect(c *gin.Context) {
 		}
 	}
 	if ipv4 == nil && ipv6 == nil {
-		apiErr(c, http.StatusServiceUnavailable, "no address space available")
-		return
+		return nil, huma.Error503ServiceUnavailable("no address space available")
 	}
 
 	psk, err := GeneratePSK()
 	if err != nil {
-		apiServerErr(c, err)
-		return
+		return nil, huma.Error500InternalServerError(err.Error())
 	}
 
 	newPeer := &Peer{
@@ -504,11 +657,9 @@ func (s *AppState) connect(c *gin.Context) {
 	}
 	if _, err := dbInsertPeer(s.db, newPeer); err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
-			apiErr(c, http.StatusConflict, "pubkey already registered")
-			return
+			return nil, huma.Error409Conflict("pubkey already registered")
 		}
-		apiServerErr(c, err)
-		return
+		return nil, huma.Error500InternalServerError(err.Error())
 	}
 
 	if err := s.wg.AddPeer(iface.Name, newPeer); err != nil {
@@ -516,7 +667,7 @@ func (s *AppState) connect(c *gin.Context) {
 	}
 
 	slog.Info("connected peer", "iface", iface.Name, "pubkey", req.Pubkey[:min(8, len(req.Pubkey))])
-	c.JSON(http.StatusOK, ConnectResponse{
+	return &ConnectOutput{Body: ConnectResponse{
 		ServerPubkey: iface.Pubkey,
 		Endpoint:     derefStr(iface.Endpoint),
 		ClientIPv4:   ipv4,
@@ -526,7 +677,7 @@ func (s *AppState) connect(c *gin.Context) {
 		Dns:          derefStr(iface.Dns),
 		Status:       "new",
 		Changes:      []string{},
-	})
+	}}, nil
 }
 
 // ── Register handler (legacy) ─────────────────────────────────────────────────
@@ -534,50 +685,49 @@ func (s *AppState) connect(c *gin.Context) {
 type RegisterRequest struct {
 	Pubkey string  `json:"pubkey"`
 	Token  string  `json:"token"`
-	Label  *string `json:"label"`
+	Label  *string `json:"label,omitempty"`
 }
 
 type RegisterResponse struct {
 	ServerPubkey string  `json:"server_pubkey"`
 	Endpoint     string  `json:"endpoint"`
-	ClientIPv4   *string `json:"client_ipv4"`
-	ClientIPv6   *string `json:"client_ipv6"`
+	ClientIPv4   *string `json:"client_ipv4,omitempty"`
+	ClientIPv6   *string `json:"client_ipv6,omitempty"`
 	Psk          string  `json:"psk"`
 	AllowedIPs   string  `json:"allowed_ips"`
 	Dns          string  `json:"dns"`
 }
 
-func (s *AppState) register(c *gin.Context) {
-	var req RegisterRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		apiErr(c, http.StatusBadRequest, err.Error())
-		return
-	}
+type RegisterInput struct {
+	Body RegisterRequest
+}
+
+type RegisterOutput struct {
+	Body RegisterResponse
+}
+
+func (s *AppState) register(_ context.Context, input *RegisterInput) (*RegisterOutput, error) {
+	req := input.Body
 
 	principalID, ifaceID, ok, err := dbConsumeToken(s.db, req.Token)
 	if err != nil {
-		apiServerErr(c, err)
-		return
+		return nil, huma.Error500InternalServerError(err.Error())
 	}
 	if !ok {
-		apiErr(c, http.StatusForbidden, "invalid or expired token")
-		return
+		return nil, huma.Error403Forbidden("invalid or expired token")
 	}
 
 	principal, err := dbGetPrincipal(s.db, principalID)
 	if err != nil || principal == nil {
-		c.Status(http.StatusNotFound)
-		return
+		return nil, huma.Error404NotFound("principal not found")
 	}
 	if principal.Status != "active" {
-		apiErr(c, http.StatusForbidden, "account suspended")
-		return
+		return nil, huma.Error403Forbidden("account suspended")
 	}
 
 	iface, err := dbGetInterfaceByID(s.db, ifaceID)
 	if err != nil || iface == nil {
-		c.Status(http.StatusNotFound)
-		return
+		return nil, huma.Error404NotFound("interface not found")
 	}
 
 	var ipv4, ipv6 *string
@@ -592,14 +742,12 @@ func (s *AppState) register(c *gin.Context) {
 		}
 	}
 	if ipv4 == nil && ipv6 == nil {
-		apiErr(c, http.StatusServiceUnavailable, "no address space available")
-		return
+		return nil, huma.Error503ServiceUnavailable("no address space available")
 	}
 
 	psk, err := GeneratePSK()
 	if err != nil {
-		apiServerErr(c, err)
-		return
+		return nil, huma.Error500InternalServerError(err.Error())
 	}
 
 	newPeer := &Peer{
@@ -609,18 +757,16 @@ func (s *AppState) register(c *gin.Context) {
 	}
 	if _, err := dbInsertPeer(s.db, newPeer); err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
-			apiErr(c, http.StatusConflict, "pubkey already registered")
-			return
+			return nil, huma.Error409Conflict("pubkey already registered")
 		}
-		apiServerErr(c, err)
-		return
+		return nil, huma.Error500InternalServerError(err.Error())
 	}
 
 	if err := s.wg.AddPeer(iface.Name, newPeer); err != nil {
 		slog.Warn("add peer to interface", "iface", iface.Name, "err", err)
 	}
 
-	c.JSON(http.StatusOK, RegisterResponse{
+	return &RegisterOutput{Body: RegisterResponse{
 		ServerPubkey: iface.Pubkey,
 		Endpoint:     derefStr(iface.Endpoint),
 		ClientIPv4:   ipv4,
@@ -628,221 +774,238 @@ func (s *AppState) register(c *gin.Context) {
 		Psk:          psk,
 		AllowedIPs:   derefStr(iface.AllowedIPs),
 		Dns:          derefStr(iface.Dns),
-	})
+	}}, nil
 }
 
 // ── Peer handlers ─────────────────────────────────────────────────────────────
 
-func (s *AppState) listPeers(c *gin.Context) {
+type ListPeersOutput struct {
+	Body []Peer
+}
+
+func (s *AppState) listPeers(_ context.Context, _ *struct{}) (*ListPeersOutput, error) {
 	peers, err := dbListPeers(s.db)
 	if err != nil {
-		apiServerErr(c, err)
-		return
+		return nil, huma.Error500InternalServerError(err.Error())
 	}
-	c.JSON(http.StatusOK, peers)
+	if peers == nil {
+		peers = []Peer{}
+	}
+	return &ListPeersOutput{Body: peers}, nil
 }
 
-func (s *AppState) updatePeer(c *gin.Context) {
-	pubkey := c.Param("pubkey")
-	var body struct {
+type PeerPubkeyParam struct {
+	Pubkey string `path:"pubkey"`
+}
+
+type UpdatePeerInput struct {
+	Pubkey string `path:"pubkey"`
+	Body   struct {
 		Label string `json:"label"`
 	}
-	if err := c.ShouldBindJSON(&body); err != nil {
-		apiErr(c, http.StatusBadRequest, err.Error())
-		return
-	}
-	ok, err := dbUpdatePeerLabel(s.db, pubkey, body.Label)
-	if err != nil {
-		apiServerErr(c, err)
-		return
-	}
-	if !ok {
-		c.Status(http.StatusNotFound)
-		return
-	}
-	c.Status(http.StatusNoContent)
 }
 
-func (s *AppState) revokePeer(c *gin.Context) {
-	pubkey := c.Param("pubkey")
-	ok, err := dbRevokePeer(s.db, pubkey)
+func (s *AppState) updatePeer(_ context.Context, input *UpdatePeerInput) (*struct{}, error) {
+	ok, err := dbUpdatePeerLabel(s.db, input.Pubkey, input.Body.Label)
 	if err != nil {
-		apiServerErr(c, err)
-		return
+		return nil, huma.Error500InternalServerError(err.Error())
 	}
 	if !ok {
-		c.Status(http.StatusNotFound)
-		return
+		return nil, huma.Error404NotFound("peer not found")
 	}
-	if ifaceName, _, err := dbPeerIfaceName(s.db, pubkey); err == nil && ifaceName != "" {
-		if err := s.wg.RemovePeer(ifaceName, pubkey); err != nil {
+	return nil, nil
+}
+
+func (s *AppState) revokePeer(_ context.Context, input *PeerPubkeyParam) (*struct{}, error) {
+	ok, err := dbRevokePeer(s.db, input.Pubkey)
+	if err != nil {
+		return nil, huma.Error500InternalServerError(err.Error())
+	}
+	if !ok {
+		return nil, huma.Error404NotFound("peer not found")
+	}
+	if ifaceName, _, err := dbPeerIfaceName(s.db, input.Pubkey); err == nil && ifaceName != "" {
+		if err := s.wg.RemovePeer(ifaceName, input.Pubkey); err != nil {
 			slog.Warn("remove peer from interface", "iface", ifaceName, "err", err)
 		}
 	}
-	slog.Info("revoked peer", "pubkey", pubkey[:min(8, len(pubkey))])
-	c.Status(http.StatusNoContent)
+	slog.Info("revoked peer", "pubkey", input.Pubkey[:min(8, len(input.Pubkey))])
+	return nil, nil
 }
 
-func (s *AppState) listPrincipalPeers(c *gin.Context) {
-	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+type ListPrincipalPeersInput struct {
+	ID int64 `path:"id"`
+}
+
+func (s *AppState) listPrincipalPeers(_ context.Context, input *ListPrincipalPeersInput) (*ListPeersOutput, error) {
+	peers, err := dbListPeersForPrincipal(s.db, input.ID)
 	if err != nil {
-		apiErr(c, http.StatusBadRequest, "invalid id")
-		return
+		return nil, huma.Error500InternalServerError(err.Error())
 	}
-	peers, err := dbListPeersForPrincipal(s.db, id)
-	if err != nil {
-		apiServerErr(c, err)
-		return
+	if peers == nil {
+		peers = []Peer{}
 	}
-	c.JSON(http.StatusOK, peers)
+	return &ListPeersOutput{Body: peers}, nil
 }
 
 // ── Principal handlers ────────────────────────────────────────────────────────
 
-func (s *AppState) listPrincipals(c *gin.Context) {
+type ListPrincipalsOutput struct {
+	Body []Principal
+}
+
+func (s *AppState) listPrincipals(_ context.Context, _ *struct{}) (*ListPrincipalsOutput, error) {
 	principals, err := dbListPrincipals(s.db)
 	if err != nil {
-		apiServerErr(c, err)
-		return
+		return nil, huma.Error500InternalServerError(err.Error())
 	}
-	c.JSON(http.StatusOK, principals)
+	if principals == nil {
+		principals = []Principal{}
+	}
+	return &ListPrincipalsOutput{Body: principals}, nil
 }
 
-func (s *AppState) getPrincipal(c *gin.Context) {
-	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+type PrincipalIDParam struct {
+	ID int64 `path:"id"`
+}
+
+type PrincipalOutput struct {
+	Body *Principal
+}
+
+func (s *AppState) getPrincipal(_ context.Context, input *PrincipalIDParam) (*PrincipalOutput, error) {
+	p, err := dbGetPrincipal(s.db, input.ID)
 	if err != nil {
-		apiErr(c, http.StatusBadRequest, "invalid id")
-		return
-	}
-	p, err := dbGetPrincipal(s.db, id)
-	if err != nil {
-		apiServerErr(c, err)
-		return
+		return nil, huma.Error500InternalServerError(err.Error())
 	}
 	if p == nil {
-		c.Status(http.StatusNotFound)
-		return
+		return nil, huma.Error404NotFound("principal not found")
 	}
-	c.JSON(http.StatusOK, p)
+	return &PrincipalOutput{Body: p}, nil
 }
 
-func (s *AppState) createPrincipal(c *gin.Context) {
-	var body struct {
-		ID       *int64  `json:"id"`
+type CreatePrincipalInput struct {
+	Body struct {
+		ID       *int64  `json:"id,omitempty"`
 		Identity string  `json:"identity"`
-		Label    *string `json:"label"`
+		Label    *string `json:"label,omitempty"`
 	}
-	if err := c.ShouldBindJSON(&body); err != nil {
-		apiErr(c, http.StatusBadRequest, err.Error())
-		return
-	}
-	id, err := dbUpsertPrincipal(s.db, body.ID, body.Identity, body.Label)
-	if err != nil {
-		apiServerErr(c, err)
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"id": id})
 }
 
-func (s *AppState) updatePrincipal(c *gin.Context) {
-	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+type CreatePrincipalOutput struct {
+	Body struct {
+		ID int64 `json:"id"`
+	}
+}
+
+func (s *AppState) createPrincipal(_ context.Context, input *CreatePrincipalInput) (*CreatePrincipalOutput, error) {
+	id, err := dbUpsertPrincipal(s.db, input.Body.ID, input.Body.Identity, input.Body.Label)
 	if err != nil {
-		apiErr(c, http.StatusBadRequest, "invalid id")
-		return
+		return nil, huma.Error500InternalServerError(err.Error())
 	}
-	var body struct {
-		Status *string `json:"status"`
-		Label  *string `json:"label"`
+	out := &CreatePrincipalOutput{}
+	out.Body.ID = id
+	return out, nil
+}
+
+type UpdatePrincipalInput struct {
+	ID   int64 `path:"id"`
+	Body struct {
+		Status *string `json:"status,omitempty"`
+		Label  *string `json:"label,omitempty"`
 	}
-	if err := c.ShouldBindJSON(&body); err != nil {
-		apiErr(c, http.StatusBadRequest, err.Error())
-		return
-	}
+}
+
+func (s *AppState) updatePrincipal(_ context.Context, input *UpdatePrincipalInput) (*struct{}, error) {
+	body := input.Body
 	if body.Status != nil {
 		if *body.Status != "active" && *body.Status != "suspended" {
-			apiErr(c, http.StatusBadRequest, "status must be 'active' or 'suspended'")
-			return
+			return nil, huma.Error400BadRequest("status must be 'active' or 'suspended'")
 		}
-		ok, err := dbUpdatePrincipalStatus(s.db, id, *body.Status)
+		ok, err := dbUpdatePrincipalStatus(s.db, input.ID, *body.Status)
 		if err != nil {
-			apiServerErr(c, err)
-			return
+			return nil, huma.Error500InternalServerError(err.Error())
 		}
 		if !ok {
-			c.Status(http.StatusNotFound)
-			return
+			return nil, huma.Error404NotFound("principal not found")
 		}
 	}
 	if body.Label != nil {
-		if err := dbUpdatePrincipalLabel(s.db, id, *body.Label); err != nil {
-			apiServerErr(c, err)
-			return
+		if err := dbUpdatePrincipalLabel(s.db, input.ID, *body.Label); err != nil {
+			return nil, huma.Error500InternalServerError(err.Error())
 		}
 	}
-	c.Status(http.StatusNoContent)
+	return nil, nil
 }
 
-func (s *AppState) deletePrincipal(c *gin.Context) {
-	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+func (s *AppState) deletePrincipal(_ context.Context, input *PrincipalIDParam) (*struct{}, error) {
+	pubkeys, err := dbDeletePrincipal(s.db, input.ID)
 	if err != nil {
-		apiErr(c, http.StatusBadRequest, "invalid id")
-		return
-	}
-	pubkeys, err := dbDeletePrincipal(s.db, id)
-	if err != nil {
-		apiServerErr(c, err)
-		return
+		return nil, huma.Error500InternalServerError(err.Error())
 	}
 	for _, pk := range pubkeys {
 		if ifaceName, _, err := dbPeerIfaceName(s.db, pk); err == nil && ifaceName != "" {
 			s.wg.RemovePeer(ifaceName, pk)
 		}
 	}
-	c.Status(http.StatusNoContent)
+	return nil, nil
 }
 
 // ── Token handlers ────────────────────────────────────────────────────────────
 
-func (s *AppState) listTokens(c *gin.Context) {
+type ListTokensOutput struct {
+	Body []Token
+}
+
+func (s *AppState) listTokens(_ context.Context, _ *struct{}) (*ListTokensOutput, error) {
 	tokens, err := dbListTokens(s.db)
 	if err != nil {
-		apiServerErr(c, err)
-		return
+		return nil, huma.Error500InternalServerError(err.Error())
 	}
-	c.JSON(http.StatusOK, tokens)
+	if tokens == nil {
+		tokens = []Token{}
+	}
+	return &ListTokensOutput{Body: tokens}, nil
 }
 
-func (s *AppState) createToken(c *gin.Context) {
-	var body struct {
+type CreateTokenInput struct {
+	Body struct {
 		PrincipalID int64  `json:"principal_id"`
 		IfaceID     int64  `json:"iface_id"`
-		UsesLeft    *int64 `json:"uses_left"`
-		Expires     *int64 `json:"expires"`
+		UsesLeft    *int64 `json:"uses_left,omitempty"`
+		Expires     *int64 `json:"expires,omitempty"`
 	}
-	if err := c.ShouldBindJSON(&body); err != nil {
-		apiErr(c, http.StatusBadRequest, err.Error())
-		return
-	}
-	token := randomToken()
-	if _, err := dbCreateToken(s.db, token, body.PrincipalID, body.IfaceID, body.UsesLeft, body.Expires); err != nil {
-		apiServerErr(c, err)
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"token": token})
 }
 
-func (s *AppState) revokeToken(c *gin.Context) {
-	token := c.Param("token")
-	ok, err := dbDeleteToken(s.db, token)
+type CreateTokenOutput struct {
+	Body struct {
+		Token string `json:"token"`
+	}
+}
+
+func (s *AppState) createToken(_ context.Context, input *CreateTokenInput) (*CreateTokenOutput, error) {
+	token := randomToken()
+	if _, err := dbCreateToken(s.db, token, input.Body.PrincipalID, input.Body.IfaceID, input.Body.UsesLeft, input.Body.Expires); err != nil {
+		return nil, huma.Error500InternalServerError(err.Error())
+	}
+	out := &CreateTokenOutput{}
+	out.Body.Token = token
+	return out, nil
+}
+
+type TokenParam struct {
+	Token string `path:"token"`
+}
+
+func (s *AppState) revokeToken(_ context.Context, input *TokenParam) (*struct{}, error) {
+	ok, err := dbDeleteToken(s.db, input.Token)
 	if err != nil {
-		apiServerErr(c, err)
-		return
+		return nil, huma.Error500InternalServerError(err.Error())
 	}
 	if !ok {
-		c.Status(http.StatusNotFound)
-		return
+		return nil, huma.Error404NotFound("token not found")
 	}
-	c.Status(http.StatusNoContent)
+	return nil, nil
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -868,31 +1031,6 @@ func derefStr(s *string) string {
 		return ""
 	}
 	return *s
-}
-
-// jsonNullableString decodes a json.RawMessage as *string.
-// "null" → nil, `"value"` → &"value".
-func jsonNullableString(raw json.RawMessage) *string {
-	if string(raw) == "null" {
-		return nil
-	}
-	var s string
-	if err := json.Unmarshal(raw, &s); err == nil {
-		return &s
-	}
-	return nil
-}
-
-// jsonNullableInt64 decodes a json.RawMessage as *int64.
-func jsonNullableInt64(raw json.RawMessage) *int64 {
-	if string(raw) == "null" {
-		return nil
-	}
-	var n int64
-	if err := json.Unmarshal(raw, &n); err == nil {
-		return &n
-	}
-	return nil
 }
 
 func unixNow() int64 {
